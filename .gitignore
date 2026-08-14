@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.npz
+*.tif
+*.tiff
+*_preview.jpg
+dataset_analysis_report.json
+.DS_Store
