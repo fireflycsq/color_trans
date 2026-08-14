@@ -45,12 +45,44 @@ def profile_from_bytes(data: bytes) -> ImageCms.ImageCmsProfile:
     return ImageCms.ImageCmsProfile(io.BytesIO(data))
 
 
+def image_to_srgb(image: Image.Image) -> Image.Image:
+    """Normalise an RGB-like image through its embedded ICC when available."""
+    rgb = image.convert("RGB")
+    icc = image.info.get("icc_profile")
+    if not icc:
+        return rgb
+    try:
+        source = profile_from_bytes(icc)
+        return ImageCms.profileToProfile(rgb, source, ImageCms.createProfile("sRGB"), outputMode="RGB")
+    except Exception:
+        return rgb
+
+
 def render_cmyk_to_srgb(image: Image.Image, icc: bytes) -> Image.Image:
     """Render CMYK through its output profile into display sRGB."""
     src = profile_from_bytes(icc)
     dst = ImageCms.createProfile("sRGB")
     transform = ImageCms.buildTransform(src, dst, "CMYK", "RGB", renderingIntent=1)
     return ImageCms.applyTransform(image.convert("CMYK"), transform)
+
+
+def hue_and_saturation(rgb_u8: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorised HSV hue (degrees) and saturation for an RGB uint8 array."""
+    rgb = np.asarray(rgb_u8, dtype=np.float32) / 255.0
+    high = rgb.max(axis=-1)
+    low = rgb.min(axis=-1)
+    delta = high - low
+    saturation = np.divide(delta, high, out=np.zeros_like(delta), where=high > 1e-6)
+    hue = np.zeros_like(high)
+    valid = delta > 1e-6
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    mr = valid & (high == r)
+    mg = valid & (high == g) & ~mr
+    mb = valid & ~(mr | mg)
+    hue[mr] = 60 * np.mod((g[mr] - b[mr]) / delta[mr], 6)
+    hue[mg] = 60 * ((b[mg] - r[mg]) / delta[mg] + 2)
+    hue[mb] = 60 * ((r[mb] - g[mb]) / delta[mb] + 4)
+    return hue, saturation
 
 
 @dataclass
@@ -68,9 +100,54 @@ class ColorModel:
             out[y:y+chunk_rows] = np.rint(np.clip(cmyk, 0, 1) * 255).astype(np.uint8)
         return out
 
-    def predict_image(self, image: Image.Image) -> Image.Image:
-        arr = np.asarray(image.convert("RGB"))
-        return Image.fromarray(self.predict_array(arr), "CMYK")
+    def predict_image(
+        self,
+        image: Image.Image,
+        max_hue_shift: float | None = None,
+        min_saturation: float = 0.16,
+        chunk_rows: int = 128,
+    ) -> Image.Image:
+        """Predict CMYK, optionally protecting hues with an ICC conversion baseline.
+
+        Pixels whose learned output rotates farther than ``max_hue_shift`` from
+        the target-profile ICC baseline are progressively blended back toward
+        that baseline. Full fallback is reached at twice the configured shift.
+        """
+        source = image_to_srgb(image)
+        if max_hue_shift is None or max_hue_shift <= 0:
+            return Image.fromarray(self.predict_array(np.asarray(source), chunk_rows), "CMYK")
+
+        width, height = source.size
+        output = np.empty((height, width, 4), dtype=np.uint8)
+        srgb = ImageCms.createProfile("sRGB")
+        cmyk_profile = profile_from_bytes(self.target_icc)
+        to_cmyk = ImageCms.buildTransform(
+            srgb, cmyk_profile, "RGB", "CMYK", renderingIntent=1,
+            flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
+        )
+        to_rgb = ImageCms.buildTransform(cmyk_profile, srgb, "CMYK", "RGB", renderingIntent=1)
+
+        for y in range(0, height, chunk_rows):
+            chunk_image = source.crop((0, y, width, min(y + chunk_rows, height)))
+            learned = self.predict_array(np.asarray(chunk_image), chunk_rows)
+            baseline_image = ImageCms.applyTransform(chunk_image, to_cmyk)
+            baseline = np.asarray(baseline_image, dtype=np.uint8)
+            learned_rgb = np.asarray(ImageCms.applyTransform(Image.fromarray(learned, "CMYK"), to_rgb))
+            baseline_rgb = np.asarray(ImageCms.applyTransform(baseline_image, to_rgb))
+
+            learned_hue, learned_sat = hue_and_saturation(learned_rgb)
+            baseline_hue, baseline_sat = hue_and_saturation(baseline_rgb)
+            hue_diff = np.abs(learned_hue - baseline_hue)
+            hue_diff = np.minimum(hue_diff, 360 - hue_diff)
+            reliable = np.maximum(learned_sat, baseline_sat) >= min_saturation
+            fallback = np.zeros_like(hue_diff, dtype=np.float32)
+            fallback[reliable] = np.clip(
+                (hue_diff[reliable] - max_hue_shift) / max_hue_shift, 0, 1
+            )
+            mixed = learned.astype(np.float32) * (1 - fallback[..., None])
+            mixed += baseline.astype(np.float32) * fallback[..., None]
+            output[y:y+len(learned)] = np.rint(mixed).astype(np.uint8)
+        return Image.fromarray(output, "CMYK")
 
     def save(self, path: str | Path) -> None:
         np.savez_compressed(

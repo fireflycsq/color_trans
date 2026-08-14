@@ -1,0 +1,4 @@
+input,target,split
+dataset/train/input/0001.jpg,dataset/train/target/0001.jpg,train
+dataset/train/input/0002.jpg,dataset/train/target/0002.jpg,train
+dataset/val/input/0101.jpg,dataset/val/target/0101.jpg,val

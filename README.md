@@ -11,6 +11,79 @@ python3 train.py \
   --model model.npz
 ```
 
+### 大规模图片对联合训练
+
+目录模式会按相对于根目录的“路径 + 文件主名”配对，扩展名可以不同。例如 `input/set_a/001.png` 会匹配 `target/set_a/001.tif`。
+
+```text
+dataset/
+├── input/
+│   ├── set_a/001.jpg
+│   └── set_b/002.png
+└── target/
+    ├── set_a/001.jpg
+    └── set_b/002.tif
+```
+
+自动按图片对拆分 90% 训练、10%验证：
+
+```bash
+mkdir -p models
+
+python3 train.py \
+  --input-dir dataset/input \
+  --target-dir dataset/target \
+  --model models/color_model_v2.npz \
+  --report models/color_model_v2.report.json \
+  --val-ratio 0.1 \
+  --samples-per-image 40000 \
+  --max-samples 3000000 \
+  --eval-samples-per-image 10000 \
+  --max-eval-samples 500000 \
+  --ridge 1.0 \
+  --seed 42
+```
+
+如果训练集与验证集已经分目录，建议显式指定，避免同一连拍组泄漏到两边：
+
+```bash
+python3 train.py \
+  --input-dir dataset/train/input \
+  --target-dir dataset/train/target \
+  --val-input-dir dataset/val/input \
+  --val-target-dir dataset/val/target \
+  --val-ratio 0 \
+  --model models/color_model_v2.npz
+```
+
+也可以复制 `dataset_manifest.example.csv`，通过 `split` 列明确指定 `train` 或 `val`：
+
+```bash
+python3 train.py \
+  --manifest dataset_manifest.csv \
+  --model models/color_model_v2.npz
+```
+
+训练器具有以下行为：
+
+- 逐张解码并累计 20×20 正规方程，内存不会随图片数量持续增长；
+- 每张图在 RGB 立方体内分层采样，减少大面积背景垄断样本；
+- `--max-samples` 是所有训练图的总采样上限；
+- 自动将带输入 ICC 的 RGB 图规范化为 sRGB；
+- 强制目标图为 CMYK、尺寸一致、内嵌 ICC 且所有目标 ICC 二进制一致；
+- 生成训练/验证 CMYK MAE、PSNR、ΔE76 分位数、RGB 色域覆盖和最差图片列表；
+- 模型和报告均不记录远程机器的绝对路径。
+
+对于 100 张 6000×4000 图片，推荐从以下配置开始：
+
+```text
+samples-per-image = 30,000～50,000
+max-samples       = 3,000,000～5,000,000
+ridge             = 1.0
+```
+
+不要循环执行单图训练命令；每次运行都会创建一个新模型，不会增量累积。
+
 ## 推理与测试
 
 ```bash
@@ -22,6 +95,48 @@ python3 test.py \
 ```
 
 建议用 TIFF 保存中间结果，避免 CMYK JPEG 的二次压缩误差；需要交付 JPEG 时把输出后缀改为 `.jpg`。
+
+## 批量处理与审核系统
+
+仓库包含一个无需前端构建工具的本地 Web 系统，支持：
+
+- 批量上传 JPG、PNG、TIFF；
+- 后台并行调用模型，输出带目标 ICC 的 CMYK TIFF；
+- 为浏览器生成目标 ICC 下的 sRGB 预览；
+- 原图/调色结果拖动对比；
+- 为每张结果上传像素对齐的 RGB/CMYK 目标图，并切换“原图/模型”或“目标图/模型”拖动对比；
+- 通过、驳回、审核备注和状态筛选；
+- 打包下载所有已通过结果和审核清单。
+
+启动：
+
+```bash
+python3 server.py \
+  --model 5D2A8056_model.npz \
+  --data web_data \
+  --host 127.0.0.1 \
+  --port 8765 \
+  --max-hue-shift 15
+```
+
+然后访问 [http://127.0.0.1:8765](http://127.0.0.1:8765)。处理记录、审核状态和输出文件保存在 `web_data/`，该目录默认不提交到 Git。
+
+可通过 `--workers 2` 调整并行任务数。大尺寸图像会占用较多内存，建议从 1～2 个并行任务开始。
+
+`--max-hue-shift 15` 会限制模型相对标准 ICC 转换的色相旋转，避免训练集外的蓝色服装被调成绿色。值越小保护越强；推荐从 12～18 度试起。设为 `0` 可关闭保护、恢复原始模型输出。
+
+### 系统目录
+
+```text
+server.py                 Python 标准库 Web/API 服务
+web/index.html            上传与审核页面
+web/app.js                批量上传、轮询和审核交互
+web/styles.css            响应式界面样式
+5D2A8056_model.npz        默认 RGB→CMYK 模型与目标 ICC
+web_data/<batch-id>/      本地批次数据（运行时生成）
+```
+
+服务默认只监听 `127.0.0.1`。若要部署到局域网或公网，应在前面增加带身份认证、HTTPS 和上传限制的反向代理。
 
 ## 数据要求
 
