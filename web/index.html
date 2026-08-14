@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chromawork · 印刷调色审核</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#upload"><span class="brand-mark">C</span><span>Chromawork</span></a>
+    <nav>
+      <a href="#upload" data-nav="upload">批量处理</a>
+      <a href="#review" data-nav="review">审核工作台</a>
+    </nav>
+    <div class="profile-chip"><span class="status-dot"></span><span id="profileName">模型就绪</span></div>
+  </header>
+
+  <main>
+    <section id="uploadView" class="view">
+      <div class="hero">
+        <p class="eyebrow">RGB → PRINT CMYK</p>
+        <h1>把一批图片，变成<br><em>一致的印刷色彩。</em></h1>
+        <p class="hero-copy">使用已训练的 Japan Color 调色模型批量处理，保留原始结构，并在交付前逐张审核。</p>
+      </div>
+
+      <div class="upload-grid">
+        <section class="panel upload-panel">
+          <div class="panel-heading">
+            <div><span class="step">01</span><h2>创建处理批次</h2></div>
+            <span class="hint">JPG · PNG · TIFF</span>
+          </div>
+          <label class="field-label" for="batchName">批次名称</label>
+          <input id="batchName" class="text-input" placeholder="例如：八月产品画册">
+          <div id="dropzone" class="dropzone" tabindex="0">
+            <input id="fileInput" type="file" accept="image/jpeg,image/png,image/tiff" multiple hidden>
+            <div class="drop-icon">↥</div>
+            <strong>拖入图片，或点击选择</strong>
+            <span>可一次选择多张，单张不超过 80 MB</span>
+          </div>
+          <div id="selection" class="selection hidden"></div>
+          <button id="startButton" class="button primary" disabled>开始批量处理 <span>→</span></button>
+        </section>
+
+        <aside class="panel process-panel">
+          <div class="panel-heading"><div><span class="step">02</span><h2>处理队列</h2></div></div>
+          <div id="emptyQueue" class="empty-state">
+            <span>◌</span><p>选择图片后，处理进度会显示在这里</p>
+          </div>
+          <div id="queue" class="queue hidden"></div>
+          <button id="reviewButton" class="button secondary hidden">进入审核工作台</button>
+        </aside>
+      </div>
+
+      <section class="recent-section">
+        <div class="section-title"><div><p class="eyebrow">RECENT BATCHES</p><h2>最近批次</h2></div><button id="refreshBatches" class="text-button">刷新</button></div>
+        <div id="batchList" class="batch-list"></div>
+      </section>
+    </section>
+
+    <section id="reviewView" class="view hidden">
+      <div class="review-header">
+        <div><button class="back-link" id="backButton">← 返回批量处理</button><p class="eyebrow">QUALITY CONTROL</p><h1 id="reviewTitle">审核工作台</h1><p id="reviewMeta" class="muted"></p></div>
+        <div class="review-actions">
+          <select id="statusFilter" class="select"><option value="all">全部图片</option><option value="pending">待审核</option><option value="approved">已通过</option><option value="rejected">已驳回</option></select>
+          <a id="downloadButton" class="button primary compact" href="#">下载已通过结果</a>
+        </div>
+      </div>
+      <div id="stats" class="stats"></div>
+      <div id="reviewGrid" class="review-grid"></div>
+      <div id="noReview" class="empty-review hidden"><span>✓</span><h3>当前筛选下没有图片</h3></div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

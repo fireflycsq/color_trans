@@ -79,8 +79,9 @@ def main() -> None:
     profile = ImageCms.ImageCmsProfile(io.BytesIO(target_icc))
     metadata = {
         "feature_model": "RGB polynomial, total degree <= 3",
-        "source": str(Path(args.input).resolve()),
-        "target": str(Path(args.target).resolve()),
+        # Store portable names rather than workstation-specific absolute paths.
+        "source": Path(args.input).name,
+        "target": Path(args.target).name,
         "target_profile": ImageCms.getProfileName(profile).strip(),
         "samples": int(len(idx)),
         "ridge": args.ridge,
