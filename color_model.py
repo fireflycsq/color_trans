@@ -165,3 +165,13 @@ class ColorModel:
                 z["target_icc"].tobytes(),
                 json.loads(str(z["metadata"])),
             )
+
+
+def load_color_model(path: str | Path):
+    """Load either the legacy polynomial model or a residual-LUT model."""
+    with np.load(path, allow_pickle=False) as z:
+        is_lut = "lut" in z.files
+    if is_lut:
+        from residual_lut_model import ResidualLUTModel
+        return ResidualLUTModel.load(path)
+    return ColorModel.load(path)

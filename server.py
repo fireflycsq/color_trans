@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from PIL import Image, ImageCms
 
-from color_model import ColorModel, render_cmyk_to_srgb
+from color_model import load_color_model, render_cmyk_to_srgb
 
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
@@ -46,7 +46,7 @@ class AppState:
         self, model_path: Path, data_dir: Path, workers: int = 2,
         max_hue_shift: float = 15.0, max_upload_mb: int = 512,
     ):
-        self.model = ColorModel.load(model_path)
+        self.model = load_color_model(model_path)
         self.model_path = model_path
         self.data_dir = data_dir
         self.max_hue_shift = max_hue_shift
@@ -451,7 +451,7 @@ def main() -> None:
     p.add_argument("--workers", type=int, default=2)
     p.add_argument(
         "--max-hue-shift", type=float, default=15.0,
-        help="maximum learned hue rotation in degrees before ICC fallback (0 disables protection)",
+        help="polynomial model hue protection; residual-LUT models use confidence fallback",
     )
     p.add_argument(
         "--max-upload-mb", type=int, default=512,

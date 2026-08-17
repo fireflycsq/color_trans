@@ -1,6 +1,6 @@
 # RGB → 印刷 CMYK 调色模型
 
-这个示例从像素级对齐的 RGB 输入与 CMYK 目标图中，学习一个带三阶交叉项的颜色映射，并把目标图的印刷 ICC 配置嵌入模型和输出文件。
+这个项目从像素级对齐的 RGB 输入与 CMYK 目标图中学习印刷调色方向。它同时提供原有三阶多项式模型，以及更稳健的“固定 ICC 基线 + 3D CMYK 残差 LUT”，并把目标印刷 ICC 嵌入模型和输出文件。
 
 ## 训练
 
@@ -157,17 +157,62 @@ python3 train.py \
 
 `--target-icc` 的含义是“统一指定解释”，不是把其他 CMYK 空间转换到该 ICC。如果图片实际来自不同印刷空间，应先完成 CMYK→CMYK 色彩管理转换，再进行训练。
 
+## ICC 基线 + 3D 残差 LUT（推荐）
+
+这套模型先用固定目标 ICC 计算标准 CMYK，再用 3D LUT 只预测人工目标相对标准结果的 `ΔC/ΔM/ΔY/ΔK`：
+
+```text
+output CMYK = ICC(input sRGB) + confidence(RGB) × residual_LUT(RGB)
+```
+
+训练命令与原训练器的数据配对方式相同，且必须明确提供固定 CMYK ICC：
+
+```bash
+python3 train_residual_lut.py \
+  --pair-dir dataset/pairs \
+  --target-icc profiles/JapanColor2001Coated.icc \
+  --val-ratio 0.1 \
+  --model models/residual_lut_v1.npz \
+  --report models/residual_lut_v1.report.json \
+  --grid-size 17 \
+  --samples-per-image 40000 \
+  --max-samples 3000000 \
+  --eval-samples-per-image 10000 \
+  --max-eval-samples 500000 \
+  --confidence-samples 32 \
+  --smoothness 0.12 \
+  --baseline-regularization 0.25 \
+  --huber-delta 8 \
+  --max-cmy-residual 20 \
+  --max-k-residual 15 \
+  --seed 42
+```
+
+训练分两遍流式读取图片：第一遍估计各 RGB 网格的残差，第二遍使用 Huber 权重降低异常图片对和错位像素的影响。每个样本按三线性权重累计到相邻 8 个 LUT 节点，训练内存由网格尺寸决定，不随照片数量增长。最后会执行相邻节点平滑、低覆盖节点向零残差回归，并保存覆盖置信度。推理遇到训练覆盖不足的颜色时会自动退回 ICC 基线。
+
+默认安全限制为 C/M/Y 最多修正 ±20、K 最多修正 ±15（均为 0～255 CMYK 数值）。报告会同时给出：
+
+- 纯 ICC 基线的 CMYK MAE、PSNR 和 ΔE76；
+- ICC + LUT 的同组指标；
+- 相对基线的平均 ΔE 改善百分比；
+- 验证集中效果最差的图片对；
+- LUT 节点覆盖数与平均置信度。
+
+推荐先使用默认 `17³` 网格。数据较少可改为 `9`，只有当颜色覆盖充分且验证集证明有效时再尝试 `33`。目标图必须为像素对齐的 CMYK 图；固定 ICC 模式解释其现有 CMYK 数值，不会偷偷转换或改写目标像素。
+
 ## 推理与测试
 
 ```bash
 python3 test.py \
-  --model model.npz \
+  --model models/residual_lut_v1.npz \
   --input "/path/to/test_input.jpg" \
   --output result.tif \
   --target "/path/to/test_target.jpg"
 ```
 
 建议用 TIFF 保存中间结果，避免 CMYK JPEG 的二次压缩误差；需要交付 JPEG 时把输出后缀改为 `.jpg`。
+
+`test.py` 和 `server.py` 会自动识别旧多项式 `.npz` 与新残差 LUT `.npz`，不需要额外指定模型类型。残差 LUT 自带覆盖置信度和 ICC 回退，因此服务端的 `--max-hue-shift` 只作用于旧多项式模型。
 
 ## 批量处理与审核系统
 
@@ -197,7 +242,7 @@ python3 server.py \
 
 可通过 `--workers 2` 调整并行任务数。大尺寸图像会占用较多内存，建议从 1～2 个并行任务开始。
 
-`--max-hue-shift 15` 会限制模型相对标准 ICC 转换的色相旋转，避免训练集外的蓝色服装被调成绿色。值越小保护越强；推荐从 12～18 度试起。设为 `0` 可关闭保护、恢复原始模型输出。
+对旧多项式模型，`--max-hue-shift 15` 会限制模型相对标准 ICC 转换的色相旋转，避免训练集外的蓝色服装被调成绿色。值越小保护越强；推荐从 12～18 度试起。设为 `0` 可关闭保护。残差 LUT 模型使用自身的覆盖置信度、残差限幅和 ICC 回退，不使用该参数。
 
 ### 系统目录
 
@@ -236,6 +281,6 @@ sudo nginx -s reload
 ## 数据要求
 
 - 输入和目标必须尺寸一致并像素级对齐。
-- 目标必须是带 ICC profile 的 CMYK 文件。
+- 目标必须是 CMYK 文件；未提供 `--target-icc` 时必须内嵌且统一 ICC，固定 ICC 模式允许目标不带配置文件。
 - 单张图只能验证对该样例的拟合能力。实际训练应覆盖不同曝光、场景和主要颜色，并按整张图片划分训练集/验证集。
 - 当前脚本是可解释的全局颜色映射，不改变锐度、纹理和几何结构。

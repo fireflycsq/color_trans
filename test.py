@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from color_model import ColorModel, render_cmyk_to_srgb, srgb_to_lab
+from color_model import load_color_model, render_cmyk_to_srgb, srgb_to_lab
 
 
 def metrics(pred: Image.Image, target: Image.Image, icc: bytes) -> None:
@@ -43,7 +43,7 @@ def main() -> None:
     p.add_argument("--quality", type=int, default=95)
     args = p.parse_args()
 
-    model = ColorModel.load(args.model)
+    model = load_color_model(args.model)
     src = Image.open(args.input)
     pred = model.predict_image(src)
     out = Path(args.output)
