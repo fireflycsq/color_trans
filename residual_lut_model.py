@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import io
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +10,7 @@ import numpy as np
 from PIL import Image, ImageCms
 
 from color_model import image_to_srgb, profile_from_bytes
+from portrait_mask import portrait_skin_mask
 
 
 def trilinear_lookup(table: np.ndarray, rgb: np.ndarray) -> np.ndarray:
@@ -42,6 +42,14 @@ def trilinear_lookup(table: np.ndarray, rgb: np.ndarray) -> np.ndarray:
     return result
 
 
+def _validate_lut(lut: np.ndarray, confidence: np.ndarray, name: str) -> None:
+    size = int(lut.shape[0])
+    if lut.shape != (size, size, size, 4):
+        raise ValueError(f"{name} lut must have shape [size, size, size, 4]")
+    if confidence.shape != (size, size, size):
+        raise ValueError(f"{name} confidence must match the first three LUT dimensions")
+
+
 @dataclass
 class ResidualLUTModel:
     """CMYK ICC conversion corrected by a confidence-gated RGB residual LUT."""
@@ -50,13 +58,16 @@ class ResidualLUTModel:
     confidence: np.ndarray
     target_icc: bytes
     metadata: dict
+    skin_lut: np.ndarray | None = None
+    skin_confidence: np.ndarray | None = None
 
     def __post_init__(self) -> None:
-        size = int(self.lut.shape[0])
-        if self.lut.shape != (size, size, size, 4):
-            raise ValueError("lut must have shape [size, size, size, 4]")
-        if self.confidence.shape != (size, size, size):
-            raise ValueError("confidence must match the first three LUT dimensions")
+        _validate_lut(self.lut, self.confidence, "global")
+        if self.skin_lut is None and self.skin_confidence is None:
+            return
+        if self.skin_lut is None or self.skin_confidence is None:
+            raise ValueError("skin_lut and skin_confidence must be provided together")
+        _validate_lut(self.skin_lut, self.skin_confidence, "skin")
 
     def predict_image(
         self,
@@ -82,6 +93,10 @@ class ResidualLUTModel:
             flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
         )
         strength = float(self.metadata.get("residual_strength", 1.0))
+        skin_strength = float(self.metadata.get("skin_residual_strength", 1.0))
+        skin_mask = None
+        if self.skin_lut is not None:
+            skin_mask = portrait_skin_mask(np.asarray(source, dtype=np.uint8))
         for y in range(0, height, chunk_rows):
             chunk = source.crop((0, y, width, min(y + chunk_rows, height)))
             rgb_u8 = np.asarray(chunk, dtype=np.uint8)
@@ -90,25 +105,41 @@ class ResidualLUTModel:
             residual = trilinear_lookup(self.lut, rgb)
             confidence = trilinear_lookup(self.confidence, rgb)
             predicted = baseline + strength * confidence[..., None] * residual
+            if skin_mask is not None:
+                mask = skin_mask[y:y + rgb.shape[0]]
+                skin_residual = trilinear_lookup(self.skin_lut, rgb)
+                skin_confidence = trilinear_lookup(self.skin_confidence, rgb)
+                predicted = predicted + (
+                    mask * skin_strength * skin_confidence
+                )[..., None] * skin_residual
             output[y:y + rgb.shape[0]] = np.rint(np.clip(predicted, 0, 1) * 255).astype(np.uint8)
         return Image.fromarray(output, "CMYK")
 
     def save(self, path: str | Path) -> None:
-        np.savez_compressed(
-            path,
-            model_type=np.array("icc_residual_lut_v1"),
-            lut=self.lut.astype(np.float32),
-            confidence=self.confidence.astype(np.float32),
-            target_icc=np.frombuffer(self.target_icc, dtype=np.uint8),
-            metadata=np.array(json.dumps(self.metadata, ensure_ascii=False)),
-        )
+        payload = {
+            "model_type": np.array("icc_residual_lut_v1"),
+            "lut": self.lut.astype(np.float32),
+            "confidence": self.confidence.astype(np.float32),
+            "target_icc": np.frombuffer(self.target_icc, dtype=np.uint8),
+            "metadata": np.array(json.dumps(self.metadata, ensure_ascii=False)),
+        }
+        if self.skin_lut is not None and self.skin_confidence is not None:
+            payload["skin_lut"] = self.skin_lut.astype(np.float32)
+            payload["skin_confidence"] = self.skin_confidence.astype(np.float32)
+        np.savez_compressed(path, **payload)
 
     @classmethod
     def load(cls, path: str | Path) -> "ResidualLUTModel":
         with np.load(path, allow_pickle=False) as z:
+            skin_lut = z["skin_lut"].astype(np.float32) if "skin_lut" in z.files else None
+            skin_confidence = (
+                z["skin_confidence"].astype(np.float32) if "skin_confidence" in z.files else None
+            )
             return cls(
                 z["lut"].astype(np.float32),
                 z["confidence"].astype(np.float32),
                 z["target_icc"].tobytes(),
                 json.loads(str(z["metadata"])),
+                skin_lut,
+                skin_confidence,
             )

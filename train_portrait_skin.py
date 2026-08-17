@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+"""Train a portrait-skin residual LUT on top of an existing global residual LUT.
+
+Stage 1 (existing model) grades the whole image. Stage 2 learns
+target_CMYK − global_CMYK only on person-skin pixels, then inference
+applies that correction inside a portrait-skin mask.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+from color_model import image_to_srgb, load_color_model
+from portrait_mask import detector_name, portrait_skin_mask
+from residual_lut_model import ResidualLUTModel, trilinear_lookup
+from train import (
+    Pair,
+    collect_pairs,
+    icc_status_counts,
+    load_fixed_target_icc,
+    profile_details,
+    sample_budget,
+    validate_pairs,
+)
+from train_residual_lut import (
+    build_to_cmyk,
+    finish_lut,
+    metric_summary,
+    predict_samples,
+    splat,
+)
+
+
+def sample_portrait_residual(
+    pair: Pair, count: int, seed: int, transform, lut: np.ndarray, confidence: np.ndarray,
+    mask_threshold: float = 0.45,
+) -> tuple[np.ndarray, np.ndarray, float] | None:
+    """RGB and target-minus-global-CMYK residual on portrait-skin pixels."""
+    with Image.open(pair.source) as source:
+        rgb_u8 = np.asarray(image_to_srgb(source), dtype=np.uint8)
+    with Image.open(pair.target) as target:
+        target_u8 = np.asarray(target.convert("CMYK"), dtype=np.uint8)
+    mask = portrait_skin_mask(rgb_u8)
+    eligible = np.flatnonzero(mask.reshape(-1) >= mask_threshold)
+    if eligible.size < 32:
+        return None
+    rng = np.random.default_rng(seed)
+    take = min(count, int(eligible.size))
+    idx = eligible[rng.choice(eligible.size, take, replace=False)]
+    rgb = rgb_u8.reshape(-1, 3)[idx].astype(np.float32) / 255.0
+    sampled_target = target_u8.reshape(-1, 4)[idx].astype(np.float32) / 255.0
+    _, global_pred = predict_samples(rgb, transform, lut, confidence)
+    return rgb, sampled_target - global_pred, float(mask.mean())
+
+
+def accumulate_portrait(
+    pairs: list[Pair], size: int, per_image: int, maximum: int, seed: int,
+    transform, lut: np.ndarray, confidence: np.ndarray, clip: np.ndarray,
+    reference: np.ndarray | None = None, huber_delta: float = 32 / 255,
+    mask_threshold: float = 0.45,
+) -> tuple[np.ndarray, np.ndarray, int, int, dict]:
+    sums = np.zeros((size, size, size, 4), dtype=np.float64)
+    weights = np.zeros((size, size, size), dtype=np.float64)
+    budget = sample_budget(len(pairs), per_image, maximum)
+    total = 0
+    used = 0
+    abs_sum = np.zeros(4, dtype=np.float64)
+    max_abs = np.zeros(4, dtype=np.float64)
+    exceeding_clip = 0
+    for i, pair in enumerate(pairs, 1):
+        sampled = sample_portrait_residual(
+            pair, budget, seed + i * 104729, transform, lut, confidence, mask_threshold,
+        )
+        if sampled is None:
+            print(f"[skin pass {'2' if reference is not None else '1'} {i:>4}/{len(pairs)}] "
+                  f"{pair.name}: no portrait-skin pixels")
+            continue
+        rgb, residual, mask_mean = sampled
+        abs_residual = np.abs(residual)
+        abs_sum += abs_residual.sum(axis=0)
+        max_abs = np.maximum(max_abs, abs_residual.max(axis=0))
+        exceeding_clip += int(np.any(abs_residual > clip + 1e-8, axis=1).sum())
+        residual = np.clip(residual, -clip, clip)
+        robust = np.ones(len(rgb), dtype=np.float32)
+        if reference is not None:
+            deviation = np.max(np.abs(residual - trilinear_lookup(reference, rgb)), axis=1)
+            robust = np.minimum(1.0, huber_delta / np.maximum(deviation, 1e-8))
+        splat(sums, weights, rgb, residual, robust)
+        total += len(rgb)
+        used += 1
+        print(
+            f"[skin pass {'2' if reference is not None else '1'} {i:>4}/{len(pairs)}] "
+            f"{pair.name}: {len(rgb):,} skin samples, mask_mean={mask_mean:.3f}, "
+            f"mean weight={robust.mean():.3f}"
+        )
+    stats = {
+        "mean_abs_255": [float(x) for x in abs_sum / max(total, 1) * 255],
+        "max_abs_255": [float(x) for x in max_abs * 255],
+        "samples_exceeding_clip": exceeding_clip,
+        "samples": total,
+        "pairs_with_skin": used,
+    }
+    return sums, weights, total, used, stats
+
+
+def evaluate_portrait(
+    pairs: list[Pair], global_lut: np.ndarray, global_confidence: np.ndarray,
+    skin_lut: np.ndarray, skin_confidence: np.ndarray, icc: bytes,
+    per_image: int, maximum: int, seed: int, label: str, mask_threshold: float,
+) -> dict | None:
+    if not pairs:
+        return None
+    transform = build_to_cmyk(icc)
+    budget = sample_budget(len(pairs), per_image, maximum)
+    globals_, predictions, targets = [], [], []
+    per_pair = []
+    for i, pair in enumerate(pairs, 1):
+        sampled = sample_portrait_residual(
+            pair, budget, seed + i * 130363, transform, global_lut, global_confidence,
+            mask_threshold,
+        )
+        if sampled is None:
+            print(f"[{label} {i:>4}/{len(pairs)}] {pair.name}: no portrait-skin pixels")
+            continue
+        rgb, residual, _ = sampled
+        _, global_pred = predict_samples(rgb, transform, global_lut, global_confidence)
+        target = np.clip(global_pred + residual, 0, 1)
+        skin_corr = (
+            trilinear_lookup(skin_lut, rgb)
+            * trilinear_lookup(skin_confidence, rgb)[..., None]
+        )
+        prediction = np.clip(global_pred + skin_corr, 0, 1)
+        pair_global = metric_summary(global_pred, target, icc)
+        pair_model = metric_summary(prediction, target, icc)
+        per_pair.append({
+            "name": pair.name, "samples": len(rgb),
+            "global_delta_e76_mean": pair_global["delta_e76"]["mean"],
+            "portrait_delta_e76_mean": pair_model["delta_e76"]["mean"],
+            "portrait_cmyk_mae": pair_model["cmyk_mae"],
+        })
+        globals_.append(global_pred)
+        predictions.append(prediction)
+        targets.append(target)
+        print(
+            f"[{label} {i:>4}/{len(pairs)}] {pair.name}: "
+            f"global ΔE={pair_global['delta_e76']['mean']:.3f}, "
+            f"portrait ΔE={pair_model['delta_e76']['mean']:.3f}"
+        )
+    if not targets:
+        return None
+    global_metrics = metric_summary(np.concatenate(globals_), np.concatenate(targets), icc)
+    model_metrics = metric_summary(np.concatenate(predictions), np.concatenate(targets), icc)
+    base_de, model_de = global_metrics["delta_e76"]["mean"], model_metrics["delta_e76"]["mean"]
+    per_pair.sort(key=lambda x: x["portrait_delta_e76_mean"], reverse=True)
+    return {
+        "pairs": len(per_pair), "samples": sum(len(x) for x in targets),
+        "global_only": global_metrics, "global_plus_portrait": model_metrics,
+        "delta_e76_improvement_percent": float(100 * (base_de - model_de) / base_de) if base_de else 0.0,
+        "worst_pairs": per_pair[:min(20, len(per_pair))],
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    source = p.add_argument_group("data source (choose one)")
+    source.add_argument("--input"); source.add_argument("--target")
+    source.add_argument("--input-dir"); source.add_argument("--target-dir")
+    source.add_argument("--pair-dir")
+    source.add_argument("--input-suffix", default="_input")
+    source.add_argument("--target-suffix", default="_target")
+    source.add_argument("--manifest")
+    source.add_argument("--val-input-dir"); source.add_argument("--val-target-dir")
+    source.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--val-ratio", type=float, default=0.1)
+    p.add_argument("--model", required=True, help="existing global residual-LUT .npz")
+    p.add_argument("--output", help="output .npz; default overwrites --model")
+    p.add_argument("--report")
+    p.add_argument("--target-icc", help="defaults to the ICC embedded in --model")
+    p.add_argument("--grid-size", type=int, default=17)
+    p.add_argument("--samples-per-image", type=int, default=20_000)
+    p.add_argument("--max-samples", type=int, default=1_500_000)
+    p.add_argument("--eval-samples-per-image", type=int, default=8_000)
+    p.add_argument("--max-eval-samples", type=int, default=250_000)
+    p.add_argument("--confidence-samples", type=float, default=8.0)
+    p.add_argument("--smoothness", type=float, default=0.06)
+    p.add_argument("--baseline-regularization", type=float, default=0.02)
+    p.add_argument("--smooth-iterations", type=int, default=40)
+    p.add_argument("--huber-delta", type=float, default=32.0)
+    p.add_argument("--max-cmy-residual", type=float, default=255.0)
+    p.add_argument("--max-k-residual", type=float, default=255.0)
+    p.add_argument("--mask-threshold", type=float, default=0.45)
+    p.add_argument("--seed", type=int, default=42)
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    if not 0 <= args.val_ratio < 1:
+        raise ValueError("--val-ratio 必须在 [0, 1) 范围")
+    if not 0 < args.mask_threshold <= 1:
+        raise ValueError("--mask-threshold 必须在 (0, 1] 范围")
+    if args.grid_size < 2:
+        raise ValueError("--grid-size 必须至少为 2")
+    loaded = load_color_model(args.model)
+    if not isinstance(loaded, ResidualLUTModel):
+        raise ValueError("人像皮肤阶段需要残差 LUT 模型，不能用旧多项式模型")
+
+    train_pairs, val_pairs = collect_pairs(args)
+    print(f"pairs: train={len(train_pairs)}, validation={len(val_pairs)}")
+    print(f"portrait detector: {detector_name()}")
+    if args.target_icc:
+        fixed_icc = load_fixed_target_icc(Path(args.target_icc))
+    else:
+        fixed_icc = loaded.target_icc
+    target_icc, train_records = validate_pairs(train_pairs, fixed_icc=fixed_icc)
+    profile_name, profile_hash = profile_details(target_icc)
+    val_records = []
+    if val_pairs:
+        _, val_records = validate_pairs(val_pairs, profile_hash, fixed_icc=fixed_icc)
+    status = icc_status_counts(train_records + val_records)
+
+    transform = build_to_cmyk(target_icc)
+    clip = np.array([args.max_cmy_residual] * 3 + [args.max_k_residual], dtype=np.float32) / 255
+    sums, weights, train_samples, used, residual_stats = accumulate_portrait(
+        train_pairs, args.grid_size, args.samples_per_image, args.max_samples,
+        args.seed, transform, loaded.lut, loaded.confidence, clip,
+        mask_threshold=args.mask_threshold,
+    )
+    if train_samples == 0:
+        raise ValueError("训练集里没有检测人人像皮肤像素，无法训练第二阶段")
+    print(
+        "skin |ΔCMYK vs global| mean: "
+        + ", ".join(f"{x:.1f}" for x in residual_stats["mean_abs_255"])
+        + f" | pairs with skin: {used}/{len(train_pairs)}"
+    )
+    initial_lut, _ = finish_lut(
+        sums, weights, args.confidence_samples, args.smoothness,
+        args.baseline_regularization, args.smooth_iterations, clip,
+    )
+    sums, weights, train_samples, used, _ = accumulate_portrait(
+        train_pairs, args.grid_size, args.samples_per_image, args.max_samples,
+        args.seed, transform, loaded.lut, loaded.confidence, clip,
+        initial_lut, args.huber_delta / 255, args.mask_threshold,
+    )
+    skin_lut, skin_confidence = finish_lut(
+        sums, weights, args.confidence_samples, args.smoothness,
+        args.baseline_regularization, args.smooth_iterations, clip,
+    )
+
+    train_metrics = evaluate_portrait(
+        train_pairs, loaded.lut, loaded.confidence, skin_lut, skin_confidence,
+        target_icc, args.eval_samples_per_image, args.max_eval_samples,
+        args.seed + 1_000_000, "train-skin", args.mask_threshold,
+    )
+    val_metrics = evaluate_portrait(
+        val_pairs, loaded.lut, loaded.confidence, skin_lut, skin_confidence,
+        target_icc, args.eval_samples_per_image, args.max_eval_samples,
+        args.seed + 2_000_000, "val-skin", args.mask_threshold,
+    )
+
+    metadata = dict(loaded.metadata)
+    metadata.update({
+        "portrait_skin": True,
+        "portrait_detector": detector_name(),
+        "portrait_grid_size": args.grid_size,
+        "portrait_train_pairs": len(train_pairs),
+        "portrait_validation_pairs": len(val_pairs),
+        "portrait_training_samples": train_samples,
+        "portrait_pairs_with_skin": used,
+        "portrait_confidence_samples": args.confidence_samples,
+        "portrait_smoothness": args.smoothness,
+        "portrait_baseline_regularization": args.baseline_regularization,
+        "portrait_huber_delta_255": args.huber_delta,
+        "portrait_residual_limits_255": [args.max_cmy_residual] * 3 + [args.max_k_residual],
+        "portrait_mask_threshold": args.mask_threshold,
+        "portrait_residual_stats": residual_stats,
+        "portrait_embedded_target_icc_status": status,
+        "portrait_created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "skin_residual_strength": 1.0,
+        "portrait_lut_nodes_with_samples": int(np.count_nonzero(weights)),
+        "portrait_mean_node_confidence": float(skin_confidence.mean()),
+        "portrait_train_metrics": train_metrics,
+        "portrait_validation_metrics": val_metrics,
+        "target_profile": profile_name,
+        "target_icc_sha256": profile_hash,
+    })
+    model = ResidualLUTModel(
+        loaded.lut, loaded.confidence, target_icc, metadata, skin_lut, skin_confidence,
+    )
+    model_path = Path(args.output or args.model)
+    report_path = Path(args.report) if args.report else model_path.with_name(
+        model_path.stem + ".portrait.report.json"
+    )
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    model.save(model_path)
+    report = metadata | {
+        "model": model_path.name,
+        "base_model": Path(args.model).name,
+        "train_images": train_records,
+        "validation_images": val_records,
+    }
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), "utf-8")
+    print(f"saved model: {model_path.resolve()}")
+    print(f"saved report: {report_path.resolve()}")
+    if val_metrics:
+        before = val_metrics["global_only"]["delta_e76"]
+        after = val_metrics["global_plus_portrait"]["delta_e76"]
+        print(f"portrait val ΔE76 global mean/p95: {before['mean']:.3f} / {before['p95']:.3f}")
+        print(f"portrait val ΔE76 +skin mean/p95: {after['mean']:.3f} / {after['p95']:.3f}")
+        print(f"portrait val mean improvement: {val_metrics['delta_e76_improvement_percent']:.2f}%")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, FileNotFoundError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(2)
