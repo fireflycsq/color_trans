@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Train a portrait-skin residual LUT on top of an existing global residual LUT.
+"""Train a portrait residual LUT on top of an existing global residual LUT.
 
-Stage 1 (existing model) grades the whole image. Stage 2 learns
-target_CMYK − global_CMYK only on person-skin pixels, then inference
-applies that correction inside a portrait-skin mask.
+Stage 1 grades the whole image. Stage 2 learns target_CMYK − global_CMYK
+inside a cut-out person mask (skin, hair, and clothing by default), then
+inference applies that correction only on the person.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import numpy as np
 from PIL import Image
 
 from color_model import image_to_srgb, load_color_model
-from portrait_mask import detector_name, portrait_skin_mask
+from portrait_mask import detector_name, portrait_mask, require_person_segmenter
 from residual_lut_model import ResidualLUTModel, trilinear_lookup
 from train import (
     Pair,
@@ -27,6 +27,7 @@ from train import (
     load_fixed_target_icc,
     profile_details,
     sample_budget,
+    stratified_indices,
     validate_pairs,
 )
 from train_residual_lut import (
@@ -40,20 +41,21 @@ from train_residual_lut import (
 
 def sample_portrait_residual(
     pair: Pair, count: int, seed: int, transform, lut: np.ndarray, confidence: np.ndarray,
-    mask_threshold: float = 0.45,
+    mask_threshold: float = 0.45, region: str = "person",
 ) -> tuple[np.ndarray, np.ndarray, float] | None:
-    """RGB and target-minus-global-CMYK residual on portrait-skin pixels."""
+    """RGB and target-minus-global-CMYK residual on portrait pixels."""
     with Image.open(pair.source) as source:
         rgb_u8 = np.asarray(image_to_srgb(source), dtype=np.uint8)
     with Image.open(pair.target) as target:
         target_u8 = np.asarray(target.convert("CMYK"), dtype=np.uint8)
-    mask = portrait_skin_mask(rgb_u8)
+    mask = portrait_mask(rgb_u8, region=region)
     eligible = np.flatnonzero(mask.reshape(-1) >= mask_threshold)
     if eligible.size < 32:
         return None
-    rng = np.random.default_rng(seed)
     take = min(count, int(eligible.size))
-    idx = eligible[rng.choice(eligible.size, take, replace=False)]
+    person_rgb = rgb_u8.reshape(-1, 3)[eligible][:, None, :]
+    local = stratified_indices(person_rgb, take, seed)
+    idx = eligible[local]
     rgb = rgb_u8.reshape(-1, 3)[idx].astype(np.float32) / 255.0
     sampled_target = target_u8.reshape(-1, 4)[idx].astype(np.float32) / 255.0
     _, global_pred = predict_samples(rgb, transform, lut, confidence)
@@ -64,7 +66,7 @@ def accumulate_portrait(
     pairs: list[Pair], size: int, per_image: int, maximum: int, seed: int,
     transform, lut: np.ndarray, confidence: np.ndarray, clip: np.ndarray,
     reference: np.ndarray | None = None, huber_delta: float = 32 / 255,
-    mask_threshold: float = 0.45,
+    mask_threshold: float = 0.45, region: str = "person",
 ) -> tuple[np.ndarray, np.ndarray, int, int, dict]:
     sums = np.zeros((size, size, size, 4), dtype=np.float64)
     weights = np.zeros((size, size, size), dtype=np.float64)
@@ -76,11 +78,12 @@ def accumulate_portrait(
     exceeding_clip = 0
     for i, pair in enumerate(pairs, 1):
         sampled = sample_portrait_residual(
-            pair, budget, seed + i * 104729, transform, lut, confidence, mask_threshold,
+            pair, budget, seed + i * 104729, transform, lut, confidence,
+            mask_threshold, region,
         )
         if sampled is None:
-            print(f"[skin pass {'2' if reference is not None else '1'} {i:>4}/{len(pairs)}] "
-                  f"{pair.name}: no portrait-skin pixels")
+            print(f"[portrait pass {'2' if reference is not None else '1'} {i:>4}/{len(pairs)}] "
+                  f"{pair.name}: no {region} pixels")
             continue
         rgb, residual, mask_mean = sampled
         abs_residual = np.abs(residual)
@@ -96,8 +99,8 @@ def accumulate_portrait(
         total += len(rgb)
         used += 1
         print(
-            f"[skin pass {'2' if reference is not None else '1'} {i:>4}/{len(pairs)}] "
-            f"{pair.name}: {len(rgb):,} skin samples, mask_mean={mask_mean:.3f}, "
+            f"[portrait pass {'2' if reference is not None else '1'} {i:>4}/{len(pairs)}] "
+            f"{pair.name}: {len(rgb):,} {region} samples, mask_mean={mask_mean:.3f}, "
             f"mean weight={robust.mean():.3f}"
         )
     stats = {
@@ -105,7 +108,7 @@ def accumulate_portrait(
         "max_abs_255": [float(x) for x in max_abs * 255],
         "samples_exceeding_clip": exceeding_clip,
         "samples": total,
-        "pairs_with_skin": used,
+        "pairs_with_portrait": used,
     }
     return sums, weights, total, used, stats
 
@@ -114,6 +117,7 @@ def evaluate_portrait(
     pairs: list[Pair], global_lut: np.ndarray, global_confidence: np.ndarray,
     skin_lut: np.ndarray, skin_confidence: np.ndarray, icc: bytes,
     per_image: int, maximum: int, seed: int, label: str, mask_threshold: float,
+    region: str = "person",
 ) -> dict | None:
     if not pairs:
         return None
@@ -124,10 +128,10 @@ def evaluate_portrait(
     for i, pair in enumerate(pairs, 1):
         sampled = sample_portrait_residual(
             pair, budget, seed + i * 130363, transform, global_lut, global_confidence,
-            mask_threshold,
+            mask_threshold, region,
         )
         if sampled is None:
-            print(f"[{label} {i:>4}/{len(pairs)}] {pair.name}: no portrait-skin pixels")
+            print(f"[{label} {i:>4}/{len(pairs)}] {pair.name}: no {region} pixels")
             continue
         rgb, residual, _ = sampled
         _, global_pred = predict_samples(rgb, transform, global_lut, global_confidence)
@@ -196,6 +200,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-cmy-residual", type=float, default=255.0)
     p.add_argument("--max-k-residual", type=float, default=255.0)
     p.add_argument("--mask-threshold", type=float, default=0.45)
+    p.add_argument(
+        "--region", choices=("person", "skin"), default="person",
+        help="person: 整个人像含头发和服装（默认）；skin: 仅皮肤",
+    )
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -210,11 +218,13 @@ def main() -> None:
         raise ValueError("--grid-size 必须至少为 2")
     loaded = load_color_model(args.model)
     if not isinstance(loaded, ResidualLUTModel):
-        raise ValueError("人像皮肤阶段需要残差 LUT 模型，不能用旧多项式模型")
+        raise ValueError("人像阶段需要残差 LUT 模型，不能用旧多项式模型")
+    if args.region == "person":
+        require_person_segmenter()
 
     train_pairs, val_pairs = collect_pairs(args)
     print(f"pairs: train={len(train_pairs)}, validation={len(val_pairs)}")
-    print(f"portrait detector: {detector_name()}")
+    print(f"portrait region: {args.region} | detector: {detector_name(args.region)}")
     if args.target_icc:
         fixed_icc = load_fixed_target_icc(Path(args.target_icc))
     else:
@@ -231,14 +241,14 @@ def main() -> None:
     sums, weights, train_samples, used, residual_stats = accumulate_portrait(
         train_pairs, args.grid_size, args.samples_per_image, args.max_samples,
         args.seed, transform, loaded.lut, loaded.confidence, clip,
-        mask_threshold=args.mask_threshold,
+        mask_threshold=args.mask_threshold, region=args.region,
     )
     if train_samples == 0:
-        raise ValueError("训练集里没有检测人人像皮肤像素，无法训练第二阶段")
+        raise ValueError("训练集里没有检测人人像像素，无法训练第二阶段")
     print(
-        "skin |ΔCMYK vs global| mean: "
+        f"{args.region} |ΔCMYK vs global| mean: "
         + ", ".join(f"{x:.1f}" for x in residual_stats["mean_abs_255"])
-        + f" | pairs with skin: {used}/{len(train_pairs)}"
+        + f" | pairs with portrait: {used}/{len(train_pairs)}"
     )
     initial_lut, _ = finish_lut(
         sums, weights, args.confidence_samples, args.smoothness,
@@ -247,7 +257,7 @@ def main() -> None:
     sums, weights, train_samples, used, _ = accumulate_portrait(
         train_pairs, args.grid_size, args.samples_per_image, args.max_samples,
         args.seed, transform, loaded.lut, loaded.confidence, clip,
-        initial_lut, args.huber_delta / 255, args.mask_threshold,
+        initial_lut, args.huber_delta / 255, args.mask_threshold, args.region,
     )
     skin_lut, skin_confidence = finish_lut(
         sums, weights, args.confidence_samples, args.smoothness,
@@ -257,23 +267,24 @@ def main() -> None:
     train_metrics = evaluate_portrait(
         train_pairs, loaded.lut, loaded.confidence, skin_lut, skin_confidence,
         target_icc, args.eval_samples_per_image, args.max_eval_samples,
-        args.seed + 1_000_000, "train-skin", args.mask_threshold,
+        args.seed + 1_000_000, "train-portrait", args.mask_threshold, args.region,
     )
     val_metrics = evaluate_portrait(
         val_pairs, loaded.lut, loaded.confidence, skin_lut, skin_confidence,
         target_icc, args.eval_samples_per_image, args.max_eval_samples,
-        args.seed + 2_000_000, "val-skin", args.mask_threshold,
+        args.seed + 2_000_000, "val-portrait", args.mask_threshold, args.region,
     )
 
     metadata = dict(loaded.metadata)
     metadata.update({
-        "portrait_skin": True,
-        "portrait_detector": detector_name(),
+        "portrait_skin": args.region == "skin",
+        "portrait_region": args.region,
+        "portrait_detector": detector_name(args.region),
         "portrait_grid_size": args.grid_size,
         "portrait_train_pairs": len(train_pairs),
         "portrait_validation_pairs": len(val_pairs),
         "portrait_training_samples": train_samples,
-        "portrait_pairs_with_skin": used,
+        "portrait_pairs_with_subject": used,
         "portrait_confidence_samples": args.confidence_samples,
         "portrait_smoothness": args.smoothness,
         "portrait_baseline_regularization": args.baseline_regularization,
@@ -321,6 +332,6 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except (ValueError, FileNotFoundError) as exc:
+    except (ValueError, FileNotFoundError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2)

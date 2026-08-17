@@ -1,7 +1,7 @@
-"""Portrait-skin mask: person region × skin chromaticity.
+"""Portrait mask for the second colour stage.
 
-Used so the second residual LUT only edits faces/limbs, not background
-colours that happen to sit near skin in RGB.
+Default region is the full person silhouette (skin, hair, clothes).
+`--region skin` keeps the older face/limb-only mask.
 """
 
 from __future__ import annotations
@@ -13,17 +13,30 @@ from PIL import Image, ImageFilter
 
 _PERSON_LOCK = threading.Lock()
 _PERSON_SEGMENTER = False  # False = not tried; None = unavailable; else model
-_WARNED_NO_PERSON = False
+_INSTALL_HINT = (
+    "抠出人像需要 mediapipe 人像分割（含头发和服装）。请安装: python3 -m pip install mediapipe"
+)
 
 
-def detector_name() -> str:
-    if _ensure_person_segmenter() is None:
+def has_person_segmenter() -> bool:
+    return _ensure_person_segmenter() is not None
+
+
+def require_person_segmenter() -> None:
+    if not has_person_segmenter():
+        raise RuntimeError(_INSTALL_HINT)
+
+
+def detector_name(region: str = "person") -> str:
+    if region == "skin" and not has_person_segmenter():
         return "ycbcr_skin"
-    return "mediapipe_selfie+ycbcr_skin"
+    if has_person_segmenter():
+        return "mediapipe_selfie" if region == "person" else "mediapipe_selfie+ycbcr_skin"
+    return "unavailable"
 
 
 def _ensure_person_segmenter():
-    global _PERSON_SEGMENTER, _WARNED_NO_PERSON
+    global _PERSON_SEGMENTER
     if _PERSON_SEGMENTER is not False:
         return _PERSON_SEGMENTER
     with _PERSON_LOCK:
@@ -39,13 +52,6 @@ def _ensure_person_segmenter():
             )
         except Exception:
             _PERSON_SEGMENTER = None
-            if not _WARNED_NO_PERSON:
-                print(
-                    "portrait mask: mediapipe not available, using skin chromaticity only "
-                    "(beige backgrounds may receive skin corrections). "
-                    "Install mediapipe to restrict edits to people."
-                )
-                _WARNED_NO_PERSON = True
     return _PERSON_SEGMENTER
 
 
@@ -65,16 +71,14 @@ def skin_probability(rgb_u8: np.ndarray) -> np.ndarray:
 
 
 def person_probability(rgb_u8: np.ndarray) -> np.ndarray:
-    """Person/selfie probability. Falls back to 1 (everywhere) without mediapipe."""
+    """Person silhouette probability, including hair and clothing."""
+    require_person_segmenter()
     segmenter = _ensure_person_segmenter()
     height, width = rgb_u8.shape[:2]
-    if segmenter is None:
-        return np.ones((height, width), dtype=np.float32)
-
     image = Image.fromarray(np.asarray(rgb_u8, dtype=np.uint8), "RGB")
     longest = max(width, height)
-    if longest > 512:
-        scale = 512 / longest
+    if longest > 768:
+        scale = 768 / longest
         small = image.resize(
             (max(1, round(width * scale)), max(1, round(height * scale))),
             Image.Resampling.BILINEAR,
@@ -93,11 +97,40 @@ def person_probability(rgb_u8: np.ndarray) -> np.ndarray:
     return mask
 
 
+def _blur_mask(mask: np.ndarray, blur_radius: float) -> np.ndarray:
+    if blur_radius <= 0:
+        return mask
+    image = Image.fromarray(np.clip(mask * 255.0, 0, 255).astype(np.uint8), "L")
+    image = image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    return np.asarray(image, dtype=np.float32) / 255.0
+
+
+def portrait_mask(
+    rgb_u8: np.ndarray, blur_radius: float = 4.0, region: str = "person",
+) -> np.ndarray:
+    """Soft portrait mask. ``region`` is ``person`` (default) or ``skin``."""
+    if region not in {"person", "skin"}:
+        raise ValueError("region 必须是 person 或 skin")
+    if region == "person":
+        mask = person_probability(rgb_u8)
+    else:
+        if has_person_segmenter():
+            mask = person_probability(rgb_u8) * skin_probability(rgb_u8)
+        else:
+            mask = skin_probability(rgb_u8)
+    return _blur_mask(mask, blur_radius)
+
+
+def portrait_region_from_metadata(metadata: dict | None) -> str:
+    meta = metadata or {}
+    region = str(meta.get("portrait_region", "")).lower()
+    if region in {"person", "skin"}:
+        return region
+    if meta.get("portrait_skin"):
+        return "skin"
+    return "person"
+
+
 def portrait_skin_mask(rgb_u8: np.ndarray, blur_radius: float = 4.0) -> np.ndarray:
-    """Soft mask for skin that lies on a person. Shape [H, W], values in [0, 1]."""
-    mask = person_probability(rgb_u8) * skin_probability(rgb_u8)
-    if blur_radius > 0:
-        image = Image.fromarray(np.clip(mask * 255.0, 0, 255).astype(np.uint8), "L")
-        image = image.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-        mask = np.asarray(image, dtype=np.float32) / 255.0
-    return mask
+    """Backward-compatible alias for the skin-only portrait mask."""
+    return portrait_mask(rgb_u8, blur_radius=blur_radius, region="skin")

@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image, ImageCms
 
 from color_model import image_to_srgb, profile_from_bytes
-from portrait_mask import portrait_skin_mask
+from portrait_mask import portrait_mask, portrait_region_from_metadata
 
 
 def trilinear_lookup(table: np.ndarray, rgb: np.ndarray) -> np.ndarray:
@@ -93,10 +93,11 @@ class ResidualLUTModel:
             flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
         )
         strength = float(self.metadata.get("residual_strength", 1.0))
-        skin_strength = float(self.metadata.get("skin_residual_strength", 1.0))
-        skin_mask = None
+        portrait_strength = float(self.metadata.get("skin_residual_strength", 1.0))
+        portrait = None
         if self.skin_lut is not None:
-            skin_mask = portrait_skin_mask(np.asarray(source, dtype=np.uint8))
+            region = portrait_region_from_metadata(self.metadata)
+            portrait = portrait_mask(np.asarray(source, dtype=np.uint8), region=region)
         for y in range(0, height, chunk_rows):
             chunk = source.crop((0, y, width, min(y + chunk_rows, height)))
             rgb_u8 = np.asarray(chunk, dtype=np.uint8)
@@ -105,13 +106,13 @@ class ResidualLUTModel:
             residual = trilinear_lookup(self.lut, rgb)
             confidence = trilinear_lookup(self.confidence, rgb)
             predicted = baseline + strength * confidence[..., None] * residual
-            if skin_mask is not None:
-                mask = skin_mask[y:y + rgb.shape[0]]
-                skin_residual = trilinear_lookup(self.skin_lut, rgb)
-                skin_confidence = trilinear_lookup(self.skin_confidence, rgb)
+            if portrait is not None:
+                mask = portrait[y:y + rgb.shape[0]]
+                extra = trilinear_lookup(self.skin_lut, rgb)
+                extra_confidence = trilinear_lookup(self.skin_confidence, rgb)
                 predicted = predicted + (
-                    mask * skin_strength * skin_confidence
-                )[..., None] * skin_residual
+                    mask * portrait_strength * extra_confidence
+                )[..., None] * extra
             output[y:y + rgb.shape[0]] = np.rint(np.clip(predicted, 0, 1) * 255).astype(np.uint8)
         return Image.fromarray(output, "CMYK")
 

@@ -220,28 +220,31 @@ python3 train_residual_lut.py \
 
 推荐先使用默认 `17³` 网格。数据较少可改为 `9`，只有当颜色覆盖充分且验证集证明有效时再尝试 `33`。目标图必须为像素对齐的 CMYK 图；固定 ICC 模式解释其现有 CMYK 数值，不会偷偷转换或改写目标像素。
 
-## 人像皮肤第二阶段
+## 人像第二阶段
 
-全局 LUT 不能区分「皮肤」和「长得像皮肤的背景」。若需要先做全图印刷调色，再单独把人像皮肤往 target 上靠，先训练全局模型，再训练皮肤残差：
+全局 LUT 不能把「人」和背景分开处理。若需要先做全图印刷调色，再抠出人像（皮肤、头发、服装）单独往 target 的调色方向靠，先训练全局模型，再训练人像残差：
 
 ```text
-输出 = 全局(ICC + LUT) + 人像皮肤遮罩 × 皮肤LUT(RGB)
+输出 = 全局(ICC + LUT) + 人像遮罩 × 人像LUT(RGB)
 ```
 
-皮肤 LUT 学的是 `target CMYK − 全局输出`，只在人像皮肤像素上采样。推理时用「人像分割 × 肤色概率」软遮罩，衣服和背景仍走全局结果。
+人像 LUT 学的是 `target CMYK − 全局输出`，只在人像轮廓内采样，并按 RGB 立方体分层，避免大面积服装淹没头发和皮肤。推理时背景仍走全局结果。需要 mediapipe 做整身分割：
 
 ```bash
-python3 -m pip install mediapipe   # 可选，用来把修正限制在人身上
+python3 -m pip install mediapipe
 
 python3 train_portrait_skin.py \
   --model models/residual_lut_human.npz \
   --pair-dir dataset/pairs \
-  --output models/residual_lut_human_skin.npz \
-  --report models/residual_lut_human_skin.portrait.report.json \
+  --region person \
+  --output models/residual_lut_human_portrait.npz \
+  --report models/residual_lut_human_portrait.portrait.report.json \
   --val-ratio 0.1
 ```
 
-`test.py` / `server.py` 会自动启用写入 `.npz` 的皮肤阶段。可用 `--save-portrait-mask mask.png` 检查遮罩。没有 mediapipe 时退回纯肤色检测，米色墙壁也可能被当成皮肤；训练和推理应使用同一套检测器。
+`--region person` 是默认值。若只要皮肤、不改头发和服装，可改为 `--region skin`。
+
+`test.py` / `server.py` 会自动启用写入 `.npz` 的人像阶段。可用 `--save-portrait-mask mask.png` 检查是否套住整个人。训练和推理必须都能做人像分割。
 
 ## 推理与测试
 

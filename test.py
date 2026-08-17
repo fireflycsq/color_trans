@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image
 
 from color_model import image_to_srgb, load_color_model, render_cmyk_to_srgb, srgb_to_lab
-from portrait_mask import portrait_skin_mask
+from portrait_mask import portrait_mask, portrait_region_from_metadata
 
 
 def metrics(pred: Image.Image, target: Image.Image, icc: bytes) -> None:
@@ -55,13 +55,14 @@ def main() -> None:
     pred.save(out, **save_args)
     extras = []
     if getattr(model, "skin_lut", None) is not None:
-        extras.append("portrait-skin on")
+        extras.append(f"portrait-{portrait_region_from_metadata(model.metadata)} on")
     extra = f", {', '.join(extras)}" if extras else ""
     print(f"saved: {out.resolve()} ({pred.mode}, embedded {model.metadata['target_profile']}{extra})")
     if args.save_portrait_mask:
-        mask = portrait_skin_mask(np.asarray(image_to_srgb(src), dtype=np.uint8))
+        region = portrait_region_from_metadata(getattr(model, "metadata", {}))
+        mask = portrait_mask(np.asarray(image_to_srgb(src), dtype=np.uint8), region=region)
         Image.fromarray(np.rint(mask * 255).astype(np.uint8), "L").save(args.save_portrait_mask)
-        print(f"saved mask: {Path(args.save_portrait_mask).resolve()}")
+        print(f"saved mask ({region}): {Path(args.save_portrait_mask).resolve()}")
     if args.target:
         target = Image.open(args.target)
         if target.size != pred.size:
