@@ -190,7 +190,27 @@ python3 train_residual_lut.py \
 
 训练分两遍流式读取图片：第一遍估计各 RGB 网格的残差，第二遍使用 Huber 权重降低异常图片对和错位像素的影响。每个样本按三线性权重累计到相邻 8 个 LUT 节点，训练内存由网格尺寸决定，不随照片数量增长。最后会执行相邻节点平滑、低覆盖节点向零残差回归，并保存覆盖置信度。推理遇到训练覆盖不足的颜色时会自动退回 ICC 基线。
 
-默认安全限制为 C/M/Y 最多修正 ±20、K 最多修正 ±15（均为 0～255 CMYK 数值）。报告会同时给出：
+默认安全限制为 C/M/Y 最多修正 ±20、K 最多修正 ±15（均为 0～255 CMYK 数值）。这会截断更大的人工改色，适合防止训练集外颜色被过度迁移。
+
+若目标是尽量拟合人工 CMYK，加 `--fit-human`。它会把残差上限放到满量程（±255），减弱向 ICC 零残差的回拉，并放宽 Huber 阈值，让大且一致的人工改动能写入 LUT。覆盖不足的颜色仍按置信度退回 ICC。已有按安全限制训练的 `.npz` 无法补回被截断的残差，必须重新训练：
+
+```bash
+python3 train_residual_lut.py \
+  --pair-dir dataset/pairs \
+  --target-icc profiles/PSOcoated_v3.icc \
+  --fit-human \
+  --val-ratio 0.1 \
+  --model models/residual_lut_human.npz \
+  --report models/residual_lut_human.report.json \
+  --grid-size 17 \
+  --samples-per-image 40000 \
+  --max-samples 3000000 \
+  --seed 42
+```
+
+仍可用 `--max-cmy-residual`、`--max-k-residual` 等参数覆盖该预设。图片对必须像素对齐，否则大幅残差会被当成「这种 RGB 都应这样改」写进全局表。
+
+报告会同时给出：
 
 - 纯 ICC 基线的 CMYK MAE、PSNR 和 ΔE76；
 - ICC + LUT 的同组指标；

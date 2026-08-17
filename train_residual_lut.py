@@ -78,13 +78,21 @@ def accumulate(
     pairs: list[Pair], size: int, per_image: int, maximum: int, seed: int,
     transform: ImageCms.ImageCmsTransform, clip: np.ndarray,
     reference: np.ndarray | None = None, huber_delta: float = 8 / 255,
-) -> tuple[np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, int, dict]:
     sums = np.zeros((size, size, size, 4), dtype=np.float64)
     weights = np.zeros((size, size, size), dtype=np.float64)
     budget = sample_budget(len(pairs), per_image, maximum)
     total = 0
+    abs_sum = np.zeros(4, dtype=np.float64)
+    max_abs = np.zeros(4, dtype=np.float64)
+    exceeding_clip = 0
     for i, pair in enumerate(pairs, 1):
         rgb, residual = sample_residual(pair, budget, seed + i * 104729, transform)
+        abs_residual = np.abs(residual)
+        abs_sum += abs_residual.sum(axis=0)
+        if len(abs_residual):
+            max_abs = np.maximum(max_abs, abs_residual.max(axis=0))
+        exceeding_clip += int(np.any(abs_residual > clip + 1e-8, axis=1).sum())
         residual = np.clip(residual, -clip, clip)
         robust = np.ones(len(rgb), dtype=np.float32)
         if reference is not None:
@@ -96,7 +104,30 @@ def accumulate(
             f"[LUT pass {'2' if reference is not None else '1'} {i:>4}/{len(pairs)}] "
             f"{pair.name}: {len(rgb):,} samples, mean weight={robust.mean():.3f}"
         )
-    return sums, weights, total
+    stats = {
+        "mean_abs_255": [float(x) for x in abs_sum / max(total, 1) * 255],
+        "max_abs_255": [float(x) for x in max_abs * 255],
+        "samples_exceeding_clip": exceeding_clip,
+        "samples": total,
+    }
+    return sums, weights, total, stats
+
+
+def apply_objective_defaults(args: argparse.Namespace) -> None:
+    """Fill unspecified hyperparameters; --fit-human prefers matching the target CMYK."""
+    human = args.fit_human
+    if args.max_cmy_residual is None:
+        args.max_cmy_residual = 255.0 if human else 20.0
+    if args.max_k_residual is None:
+        args.max_k_residual = 255.0 if human else 15.0
+    if args.baseline_regularization is None:
+        args.baseline_regularization = 0.02 if human else 0.25
+    if args.smoothness is None:
+        args.smoothness = 0.06 if human else 0.12
+    if args.huber_delta is None:
+        args.huber_delta = 32.0 if human else 8.0
+    if args.confidence_samples is None:
+        args.confidence_samples = 8.0 if human else 32.0
 
 
 def neighbour_sum(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -229,19 +260,24 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-samples", type=int, default=3_000_000)
     p.add_argument("--eval-samples-per-image", type=int, default=10_000)
     p.add_argument("--max-eval-samples", type=int, default=500_000)
-    p.add_argument("--confidence-samples", type=float, default=32.0)
-    p.add_argument("--smoothness", type=float, default=0.12)
-    p.add_argument("--baseline-regularization", type=float, default=0.25)
+    p.add_argument("--confidence-samples", type=float, default=None)
+    p.add_argument("--smoothness", type=float, default=None)
+    p.add_argument("--baseline-regularization", type=float, default=None)
     p.add_argument("--smooth-iterations", type=int, default=40)
-    p.add_argument("--huber-delta", type=float, default=8.0, help="robust threshold in CMYK 0..255")
-    p.add_argument("--max-cmy-residual", type=float, default=20.0, help="C/M/Y correction limit")
-    p.add_argument("--max-k-residual", type=float, default=15.0, help="K correction limit")
+    p.add_argument("--huber-delta", type=float, default=None, help="robust threshold in CMYK 0..255")
+    p.add_argument("--max-cmy-residual", type=float, default=None, help="C/M/Y correction limit")
+    p.add_argument("--max-k-residual", type=float, default=None, help="K correction limit")
+    p.add_argument(
+        "--fit-human", action="store_true",
+        help="fit target CMYK closely: full-range residuals, weaker ICC pull-back",
+    )
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    apply_objective_defaults(args)
     if not 0 <= args.val_ratio < 1: raise ValueError("--val-ratio 必须在 [0, 1) 范围")
     if args.grid_size < 2: raise ValueError("--grid-size 必须至少为 2")
     positive = ("samples_per_image", "max_samples", "eval_samples_per_image", "max_eval_samples",
@@ -253,6 +289,12 @@ def main() -> None:
 
     train_pairs, val_pairs = collect_pairs(args)
     print(f"pairs: train={len(train_pairs)}, validation={len(val_pairs)}")
+    print(
+        f"objective: {'fit_human' if args.fit_human else 'safe_print'} | "
+        f"residual limits C/M/Y ±{args.max_cmy_residual:g}, K ±{args.max_k_residual:g} | "
+        f"huber={args.huber_delta:g} smoothness={args.smoothness:g} "
+        f"baseline_reg={args.baseline_regularization:g} confidence_samples={args.confidence_samples:g}"
+    )
     fixed_icc = load_fixed_target_icc(Path(args.target_icc))
     target_icc, train_records = validate_pairs(train_pairs, fixed_icc=fixed_icc)
     profile_name, profile_hash = profile_details(target_icc)
@@ -264,15 +306,21 @@ def main() -> None:
 
     transform = build_to_cmyk(target_icc)
     clip = np.array([args.max_cmy_residual] * 3 + [args.max_k_residual], dtype=np.float32) / 255
-    sums, weights, train_samples = accumulate(
+    sums, weights, train_samples, residual_stats = accumulate(
         train_pairs, args.grid_size, args.samples_per_image, args.max_samples,
         args.seed, transform, clip,
+    )
+    print(
+        "unclipped |ΔCMYK| mean: "
+        + ", ".join(f"{x:.1f}" for x in residual_stats["mean_abs_255"])
+        + f" | max: {max(residual_stats['max_abs_255']):.1f} | "
+        f"samples beyond clip: {residual_stats['samples_exceeding_clip']:,}/{train_samples:,}"
     )
     initial_lut, _ = finish_lut(
         sums, weights, args.confidence_samples, args.smoothness,
         args.baseline_regularization, args.smooth_iterations, clip,
     )
-    sums, weights, _ = accumulate(
+    sums, weights, _, _ = accumulate(
         train_pairs, args.grid_size, args.samples_per_image, args.max_samples,
         args.seed, transform, clip, initial_lut, args.huber_delta / 255,
     )
@@ -303,6 +351,8 @@ def main() -> None:
         "baseline_regularization": args.baseline_regularization,
         "smooth_iterations": args.smooth_iterations, "huber_delta_255": args.huber_delta,
         "residual_limits_255": [args.max_cmy_residual] * 3 + [args.max_k_residual],
+        "fit_human": args.fit_human,
+        "residual_stats_unclipped": residual_stats,
         "residual_strength": 1.0,
         "lut_nodes_with_samples": int(np.count_nonzero(weights)),
         "lut_nodes_total": int(weights.size),
