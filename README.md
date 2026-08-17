@@ -284,3 +284,24 @@ sudo nginx -s reload
 - 目标必须是 CMYK 文件；未提供 `--target-icc` 时必须内嵌且统一 ICC，固定 ICC 模式允许目标不带配置文件。
 - 单张图只能验证对该样例的拟合能力。实际训练应覆盖不同曝光、场景和主要颜色，并按整张图片划分训练集/验证集。
 - 当前脚本是可解释的全局颜色映射，不改变锐度、纹理和几何结构。
+
+## 批量比较图片自带 ICC 与指定 ICC
+
+如果一批图片内嵌了不同的 ICC，希望在不改变原始像素值的情况下，比较“按图片自带 ICC
+显示”和“统一按指定 ICC 显示”的差异，可以运行：
+
+```bash
+python3 compare_icc.py \
+  --input-dir /path/to/cmyk-images \
+  --assigned-icc profiles/JapanColor2001Coated.icc \
+  --output-dir icc-comparison
+```
+
+程序递归扫描 JPG、TIFF 和 PNG，为每张有效图片生成三联 JPEG：自带 ICC 渲染、指定 ICC
+渲染和 ΔE76 热力图。同时生成按平均色差排序的 `icc_comparison_report.json` 和可用 Excel
+打开的 `icc_comparison_report.csv`。默认使用相对色度意图和黑点补偿，并把长边缩到 1600
+像素后生成预览和计算色差；可通过 `--max-dimension` 调整。
+
+这里的指定 ICC 是用来重新解释不变的 RGB/CMYK 像素值，并非完成源空间到目标空间的颜色
+转换。指定 ICC、内嵌 ICC 的色彩空间必须与图片模式一致；缺少 ICC 或配置不匹配的图片会记录
+在报告中而不会中断整批处理。
