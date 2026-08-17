@@ -131,6 +131,32 @@ ridge             = 1.0
 
 不要循环执行单图训练命令；每次运行都会创建一个新模型，不会增量累积。
 
+### 使用固定目标 ICC 文件训练
+
+如果所有目标 CMYK 数值本来就属于同一个印刷空间，可以通过 `--target-icc` 指定固定配置文件。目标图片可以没有内嵌 ICC，图片中已有但不同的 ICC 也只用于报告，不会阻止训练：
+
+```bash
+python3 train.py \
+  --pair-dir dataset/pairs \
+  --target-icc profiles/JapanColor2001Coated.icc \
+  --val-ratio 0.1 \
+  --model models/color_model_v2.npz \
+  --report models/color_model_v2.report.json \
+  --samples-per-image 40000 \
+  --max-samples 3000000 \
+  --ridge 1.0
+```
+
+该模式会：
+
+- 检查指定文件确实是可用的 CMYK 输出 ICC；
+- 使用它计算验证集的显示色差；
+- 将它完整嵌入 `.npz` 模型和后续 CMYK 输出；
+- 在报告中统计目标图内嵌 ICC 的 `matching / different / missing` 数量；
+- 保持目标图原有 C、M、Y、K 数值不变。
+
+`--target-icc` 的含义是“统一指定解释”，不是把其他 CMYK 空间转换到该 ICC。如果图片实际来自不同印刷空间，应先完成 CMYK→CMYK 色彩管理转换，再进行训练。
+
 ## 推理与测试
 
 ```bash

@@ -237,8 +237,26 @@ def profile_details(icc: bytes) -> tuple[str, str]:
     return ImageCms.getProfileName(profile).strip(), hashlib.sha256(icc).hexdigest()
 
 
-def validate_pairs(pairs: Iterable[Pair], expected_icc_hash: str | None = None) -> tuple[bytes, list[dict]]:
-    target_icc: bytes | None = None
+def load_fixed_target_icc(path: Path) -> bytes:
+    if not path.is_file():
+        raise FileNotFoundError(f"固定 ICC 文件不存在：{path}")
+    data = path.read_bytes()
+    try:
+        profile = ImageCms.ImageCmsProfile(io.BytesIO(data))
+        ImageCms.buildTransform(
+            profile, ImageCms.createProfile("sRGB"), "CMYK", "RGB", renderingIntent=1
+        )
+    except Exception as exc:
+        raise ValueError(f"固定 ICC 不是可用的 CMYK 输出配置文件：{path}: {exc}") from exc
+    return data
+
+
+def validate_pairs(
+    pairs: Iterable[Pair], expected_icc_hash: str | None = None,
+    fixed_icc: bytes | None = None,
+) -> tuple[bytes, list[dict]]:
+    target_icc: bytes | None = fixed_icc
+    fixed_hash = profile_details(fixed_icc)[1] if fixed_icc else None
     records = []
     for pair in pairs:
         if not pair.source.exists() or not pair.target.exists():
@@ -249,19 +267,47 @@ def validate_pairs(pairs: Iterable[Pair], expected_icc_hash: str | None = None) 
             if target.mode != "CMYK":
                 raise ValueError(f"目标图必须是 CMYK，{pair.target} 当前为 {target.mode}")
             icc = target.info.get("icc_profile")
-            if not icc:
-                raise ValueError(f"目标图没有内嵌 ICC：{pair.target}")
-            name, digest = profile_details(icc)
-            if expected_icc_hash and digest != expected_icc_hash:
-                raise ValueError(f"目标 ICC 不一致：{pair.target} ({name}, {digest[:12]})")
-            if target_icc is None:
-                target_icc = icc
-                expected_icc_hash = digest
-            elif digest != expected_icc_hash:
-                raise ValueError(f"目标 ICC 不一致：{pair.target} ({name}, {digest[:12]})")
-            records.append({"name": pair.name, "width": src.width, "height": src.height})
+            embedded_name = None
+            embedded_hash = None
+            if icc:
+                embedded_name, embedded_hash = profile_details(icc)
+
+            if fixed_icc:
+                icc_status = "matching" if embedded_hash == fixed_hash else (
+                    "different" if embedded_hash else "missing"
+                )
+            else:
+                if not icc:
+                    raise ValueError(f"目标图没有内嵌 ICC：{pair.target}")
+                if expected_icc_hash and embedded_hash != expected_icc_hash:
+                    raise ValueError(
+                        f"目标 ICC 不一致：{pair.target} ({embedded_name}, {embedded_hash[:12]})"
+                    )
+                if target_icc is None:
+                    target_icc = icc
+                    expected_icc_hash = embedded_hash
+                elif embedded_hash != expected_icc_hash:
+                    raise ValueError(
+                        f"目标 ICC 不一致：{pair.target} ({embedded_name}, {embedded_hash[:12]})"
+                    )
+                icc_status = "matching"
+            records.append({
+                "name": pair.name,
+                "width": src.width,
+                "height": src.height,
+                "embedded_icc_status": icc_status,
+                "embedded_icc_name": embedded_name,
+                "embedded_icc_sha256": embedded_hash,
+            })
     assert target_icc is not None
     return target_icc, records
+
+
+def icc_status_counts(records: Iterable[dict]) -> dict[str, int]:
+    counts = {"matching": 0, "different": 0, "missing": 0}
+    for record in records:
+        counts[record["embedded_icc_status"]] += 1
+    return counts
 
 
 def sample_pair(pair: Pair, count: int, seed: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -371,6 +417,10 @@ def parse_args() -> argparse.Namespace:
     source.add_argument("--val-target-dir", help="optional validation CMYK directory")
     source.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--val-ratio", type=float, default=0.1, help="automatic validation fraction")
+    p.add_argument(
+        "--target-icc",
+        help="fixed CMYK ICC assigned to all target values and embedded in the model",
+    )
     p.add_argument("--model", default="color_model.npz")
     p.add_argument("--report", help="JSON report path; defaults next to model")
     p.add_argument("--samples", type=int, help="legacy single-pair sample count")
@@ -398,12 +448,20 @@ def main() -> None:
     train_pairs, val_pairs = collect_pairs(args)
     print(f"pairs: train={len(train_pairs)}, validation={len(val_pairs)}")
 
-    target_icc, train_records = validate_pairs(train_pairs)
+    fixed_icc = load_fixed_target_icc(Path(args.target_icc)) if args.target_icc else None
+    target_icc, train_records = validate_pairs(train_pairs, fixed_icc=fixed_icc)
     profile_name, profile_hash = profile_details(target_icc)
     val_records = []
     if val_pairs:
-        _, val_records = validate_pairs(val_pairs, profile_hash)
+        _, val_records = validate_pairs(val_pairs, profile_hash, fixed_icc=fixed_icc)
     print(f"target profile: {profile_name} ({profile_hash[:12]})")
+    all_icc_status = icc_status_counts(train_records + val_records)
+    if fixed_icc:
+        print(
+            "embedded target ICC (informational only): "
+            f"matching={all_icc_status['matching']}, "
+            f"different={all_icc_status['different']}, missing={all_icc_status['missing']}"
+        )
 
     a, b, train_samples, coverage = accumulate_training(
         train_pairs, args.samples_per_image, args.max_samples, args.seed
@@ -423,6 +481,9 @@ def main() -> None:
         "feature_model": "RGB polynomial, total degree <= 3",
         "target_profile": profile_name,
         "target_icc_sha256": profile_hash,
+        "target_icc_source": Path(args.target_icc).name if args.target_icc else "embedded_in_targets",
+        "target_icc_mode": "fixed_assignment_no_pixel_conversion" if fixed_icc else "strict_embedded",
+        "embedded_target_icc_status": all_icc_status,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "train_pairs": len(train_pairs),
         "validation_pairs": len(val_pairs),
