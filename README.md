@@ -189,7 +189,8 @@ python3 server.py \
   --data web_data \
   --host 127.0.0.1 \
   --port 8765 \
-  --max-hue-shift 15
+  --max-hue-shift 15 \
+  --max-upload-mb 512
 ```
 
 然后访问 [http://127.0.0.1:8765](http://127.0.0.1:8765)。处理记录、审核状态和输出文件保存在 `web_data/`，该目录默认不提交到 Git。
@@ -213,12 +214,12 @@ web_data/<batch-id>/      本地批次数据（运行时生成）
 
 ### 目标图上传出现 `Failed to fetch`
 
-更新代码后必须重启 `server.py`。目标图现在按 1 MB 分块落盘，并在 ICC 转换前缩小审核预览，可显著降低大尺寸 CMYK 图片的内存峰值。默认单文件上限为 80 MB。
+更新代码后必须重启 `server.py`。输入图和目标图都会按 1 MB 分块落盘，目标图在 ICC 转换前缩小审核预览，可显著降低大尺寸图片上传时的内存峰值。默认单文件上限为 512 MB，可通过 `--max-upload-mb` 调整。
 
 如果前面使用 Nginx，还需要在站点配置的 `server` 或 `location` 中设置：
 
 ```nginx
-client_max_body_size 80m;
+client_max_body_size 512m;
 proxy_read_timeout 300s;
 proxy_send_timeout 300s;
 ```

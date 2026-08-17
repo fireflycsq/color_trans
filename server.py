@@ -25,7 +25,6 @@ from PIL import Image, ImageCms
 from color_model import ColorModel, render_cmyk_to_srgb
 
 
-MAX_UPLOAD_BYTES = 80 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 
 
@@ -43,11 +42,16 @@ def safe_filename(name: str) -> str:
 
 
 class AppState:
-    def __init__(self, model_path: Path, data_dir: Path, workers: int = 2, max_hue_shift: float = 15.0):
+    def __init__(
+        self, model_path: Path, data_dir: Path, workers: int = 2,
+        max_hue_shift: float = 15.0, max_upload_mb: int = 512,
+    ):
         self.model = ColorModel.load(model_path)
         self.model_path = model_path
         self.data_dir = data_dir
         self.max_hue_shift = max_hue_shift
+        self.max_upload_mb = max_upload_mb
+        self.max_upload_bytes = max_upload_mb * 1024 * 1024
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="colour")
@@ -117,20 +121,21 @@ class AppState:
             "pending": sum(x["review_status"] == "pending" for x in images),
         }
 
-    def add_upload(self, batch_id: str, filename: str, body: bytes) -> dict:
+    def add_upload_file(
+        self, batch_id: str, filename: str, uploaded_path: Path, size_bytes: int
+    ) -> dict:
         filename = safe_filename(filename)
         image_id = uuid.uuid4().hex[:12]
         stored_name = image_id + Path(filename).suffix
         path = self.batch_dir(batch_id) / "input" / stored_name
-        path.write_bytes(body)
         try:
-            with Image.open(path) as image:
+            with Image.open(uploaded_path) as image:
                 image.verify()
-            with Image.open(path) as image:
+            with Image.open(uploaded_path) as image:
                 width, height = image.size
         except Exception:
-            path.unlink(missing_ok=True)
             raise ValueError("上传内容不是有效图片")
+        uploaded_path.replace(path)
 
         with self.lock:
             batch = self.read_batch(batch_id)
@@ -145,7 +150,7 @@ class AppState:
                 "target_filename": None,
                 "width": width,
                 "height": height,
-                "size_bytes": len(body),
+                "size_bytes": size_bytes,
                 "process_status": "queued",
                 "review_status": "pending",
                 "note": "",
@@ -330,7 +335,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             parsed = urlparse(self.path)
             parts = [x for x in parsed.path.split("/") if x]
-            if parsed.path == "/api/batches":
+            if parsed.path == "/api/config":
+                self.json_response({
+                    "max_upload_mb": self.app.max_upload_mb,
+                    "max_upload_bytes": self.app.max_upload_bytes,
+                })
+            elif parsed.path == "/api/batches":
                 self.json_response(self.app.list_batches())
             elif len(parts) == 3 and parts[:2] == ["api", "batches"]:
                 batch = self.app.read_batch(parts[2])
@@ -381,16 +391,23 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "images":
                 length = int(self.headers.get("Content-Length", "0"))
-                if length <= 0 or length > MAX_UPLOAD_BYTES:
-                    raise ValueError("单张图片大小必须在 80 MB 以内")
+                if length <= 0 or length > self.app.max_upload_bytes:
+                    raise ValueError(f"单张图片大小必须在 {self.app.max_upload_mb} MB 以内")
                 filename = parse_qs(parsed.query).get("filename", [""])[0]
-                item = self.app.add_upload(parts[2], filename, self.rfile.read(length))
+                upload_dir = self.app.batch_dir(parts[2]) / "input"
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                temporary = upload_dir / f".{uuid.uuid4().hex}.upload"
+                try:
+                    self.receive_upload(temporary, length)
+                    item = self.app.add_upload_file(parts[2], filename, temporary, length)
+                finally:
+                    temporary.unlink(missing_ok=True)
                 self.json_response(item, 202)
                 return
             if len(parts) == 5 and parts[:2] == ["api", "batches"] and parts[4] == "target":
                 length = int(self.headers.get("Content-Length", "0"))
-                if length <= 0 or length > MAX_UPLOAD_BYTES:
-                    raise ValueError("目标图大小必须在 80 MB 以内")
+                if length <= 0 or length > self.app.max_upload_bytes:
+                    raise ValueError(f"目标图大小必须在 {self.app.max_upload_mb} MB 以内")
                 filename = parse_qs(parsed.query).get("filename", [""])[0]
                 upload_dir = self.app.batch_dir(parts[2]) / "target"
                 upload_dir.mkdir(parents=True, exist_ok=True)
@@ -436,8 +453,17 @@ def main() -> None:
         "--max-hue-shift", type=float, default=15.0,
         help="maximum learned hue rotation in degrees before ICC fallback (0 disables protection)",
     )
+    p.add_argument(
+        "--max-upload-mb", type=int, default=512,
+        help="maximum size of one input or target image in MB",
+    )
     args = p.parse_args()
-    app = AppState(Path(args.model), Path(args.data), args.workers, args.max_hue_shift)
+    if args.max_upload_mb <= 0:
+        raise ValueError("--max-upload-mb must be greater than zero")
+    app = AppState(
+        Path(args.model), Path(args.data), args.workers,
+        args.max_hue_shift, args.max_upload_mb,
+    )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.app = app  # type: ignore[attr-defined]
     print(f"Color Review running at http://{args.host}:{args.port}")
