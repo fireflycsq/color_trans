@@ -211,6 +211,27 @@ web_data/<batch-id>/      本地批次数据（运行时生成）
 
 服务默认只监听 `127.0.0.1`。若要部署到局域网或公网，应在前面增加带身份认证、HTTPS 和上传限制的反向代理。
 
+### 目标图上传出现 `Failed to fetch`
+
+更新代码后必须重启 `server.py`。目标图现在按 1 MB 分块落盘，并在 ICC 转换前缩小审核预览，可显著降低大尺寸 CMYK 图片的内存峰值。默认单文件上限为 80 MB。
+
+如果前面使用 Nginx，还需要在站点配置的 `server` 或 `location` 中设置：
+
+```nginx
+client_max_body_size 80m;
+proxy_read_timeout 300s;
+proxy_send_timeout 300s;
+```
+
+然后检查并重载：
+
+```bash
+sudo nginx -t
+sudo nginx -s reload
+```
+
+若仍然失败，先确认 Python 服务没有因内存不足退出，并检查服务终端日志。页面现在会把网络中断提示为“无法连接服务器”，HTTP 413/400 等服务端错误则会显示相应状态或具体校验原因。
+
 ## 数据要求
 
 - 输入和目标必须尺寸一致并像素级对齐。

@@ -197,7 +197,9 @@ class AppState:
             raise ValueError("非法审核状态")
         return self.update_item(batch_id, image_id, review_status=status, note=note[:500])
 
-    def add_target(self, batch_id: str, image_id: str, filename: str, body: bytes) -> dict:
+    def add_target_file(
+        self, batch_id: str, image_id: str, filename: str, uploaded_path: Path
+    ) -> dict:
         """Attach an aligned RGB/CMYK reference image to one review item."""
         filename = safe_filename(filename)
         batch = self.read_batch(batch_id)
@@ -213,14 +215,17 @@ class AppState:
         stored_name = image_id + Path(filename).suffix
         preview_name = image_id + ".jpg"
         path = target_dir / stored_name
-        path.write_bytes(body)
         try:
-            with Image.open(path) as target:
+            with Image.open(uploaded_path) as target:
                 if target.size != (item["width"], item["height"]):
                     raise ValueError(
                         f"目标图尺寸必须与原图一致：需要 {item['width']}×{item['height']}，"
                         f"实际为 {target.width}×{target.height}"
                     )
+                # Generate only a review-size image before ICC conversion. A
+                # full 24 MP CMYK + RGB render can otherwise exceed 200 MB.
+                target.draft(target.mode, (1800, 1800))
+                target.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
                 if target.mode == "CMYK":
                     icc = target.info.get("icc_profile") or self.model.target_icc
                     preview = render_cmyk_to_srgb(target, icc)
@@ -240,13 +245,13 @@ class AppState:
                 preview.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
                 preview.save(preview_dir / preview_name, quality=91, optimize=True)
         except Exception:
-            path.unlink(missing_ok=True)
             (preview_dir / preview_name).unlink(missing_ok=True)
             raise
 
         old_target = item.get("target_file")
         if old_target and old_target != stored_name:
             (target_dir / old_target).unlink(missing_ok=True)
+        uploaded_path.replace(path)
         return self.update_item(
             batch_id, image_id,
             target_file=stored_name,
@@ -295,6 +300,17 @@ class Handler(BaseHTTPRequestHandler):
         if length > 64 * 1024:
             raise ValueError("请求过大")
         return json.loads(self.rfile.read(length) or b"{}")
+
+    def receive_upload(self, path: Path, length: int) -> None:
+        """Stream an HTTP request body to disk without retaining it in RAM."""
+        remaining = length
+        with path.open("wb") as output:
+            while remaining:
+                chunk = self.rfile.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ConnectionError("上传连接提前中断")
+                output.write(chunk)
+                remaining -= len(chunk)
 
     def send_file(self, path: Path, download_name: str | None = None) -> None:
         if not path.exists() or not path.is_file():
@@ -376,7 +392,14 @@ class Handler(BaseHTTPRequestHandler):
                 if length <= 0 or length > MAX_UPLOAD_BYTES:
                     raise ValueError("目标图大小必须在 80 MB 以内")
                 filename = parse_qs(parsed.query).get("filename", [""])[0]
-                item = self.app.add_target(parts[2], parts[3], filename, self.rfile.read(length))
+                upload_dir = self.app.batch_dir(parts[2]) / "target"
+                upload_dir.mkdir(parents=True, exist_ok=True)
+                temporary = upload_dir / f".{parts[3]}.{uuid.uuid4().hex}.upload"
+                try:
+                    self.receive_upload(temporary, length)
+                    item = self.app.add_target_file(parts[2], parts[3], filename, temporary)
+                finally:
+                    temporary.unlink(missing_ok=True)
                 self.json_response(item, 201)
                 return
             self.send_error(404)
