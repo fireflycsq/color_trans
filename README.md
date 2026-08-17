@@ -13,6 +13,53 @@ python3 train.py \
 
 ### 大规模图片对联合训练
 
+#### 同一目录的 `_input` / `_target` 数据
+
+如果图片对放在同一个目录：
+
+```text
+dataset/pairs/
+├── 0001_input.jpg
+├── 0001_target.jpg
+├── 0002_input.png
+├── 0002_target.tif
+├── scene_a/0003_input.jpg
+└── scene_a/0003_target.jpg
+```
+
+直接使用 `--pair-dir`。程序以去掉 `_input` 或 `_target` 后的相对路径作为配对键，并按整组图片对自动划分训练集和验证集：
+
+```bash
+mkdir -p models
+
+python3 train.py \
+  --pair-dir dataset/pairs \
+  --val-ratio 0.1 \
+  --model models/color_model_v2.npz \
+  --report models/color_model_v2.report.json \
+  --samples-per-image 40000 \
+  --max-samples 3000000 \
+  --eval-samples-per-image 10000 \
+  --max-eval-samples 500000 \
+  --ridge 1.0 \
+  --seed 42
+```
+
+默认后缀是 `_input` 和 `_target`。如果文件名是 `xxx_src.jpg`、`xxx_ref.jpg`，可以改为：
+
+```bash
+python3 train.py \
+  --pair-dir dataset/pairs \
+  --input-suffix _src \
+  --target-suffix _ref \
+  --val-ratio 0.1 \
+  --model models/color_model_v2.npz
+```
+
+没有以这两个后缀结尾的其他图片会被忽略；只有一侧存在、同一配对键重复或主文件名为空时会停止并明确报错。
+
+#### 输入和目标分目录
+
 目录模式会按相对于根目录的“路径 + 文件主名”配对，扩展名可以不同。例如 `input/set_a/001.png` 会匹配 `target/set_a/001.tif`。
 
 ```text

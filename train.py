@@ -109,6 +109,56 @@ def directory_pairs(input_dir: Path, target_dir: Path, recursive: bool) -> list[
     return [Pair(sources[key], targets[key]) for key in sorted(sources)]
 
 
+def paired_directory_pairs(
+    root: Path, input_suffix: str, target_suffix: str, recursive: bool
+) -> list[Pair]:
+    """Pair ``xxx_input.*`` and ``xxx_target.*`` files inside one directory."""
+    if not root.is_dir():
+        raise ValueError(f"配对目录不存在：{root}")
+    if not input_suffix or not target_suffix or input_suffix == target_suffix:
+        raise ValueError("输入和目标后缀必须非空且互不相同")
+    glob = "**/*" if recursive else "*"
+    sources: dict[str, Path] = {}
+    targets: dict[str, Path] = {}
+
+    for path in root.glob(glob):
+        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        stem = path.stem
+        kind: str | None = None
+        if stem.endswith(input_suffix):
+            base_stem = stem[:-len(input_suffix)]
+            kind = "input"
+        elif stem.endswith(target_suffix):
+            base_stem = stem[:-len(target_suffix)]
+            kind = "target"
+        else:
+            continue
+        if not base_stem:
+            raise ValueError(f"文件名缺少配对主名：{path}")
+        relative_parent = path.parent.relative_to(root).as_posix()
+        key = f"{relative_parent}/{base_stem}" if relative_parent != "." else base_stem
+        index = sources if kind == "input" else targets
+        if key in index:
+            raise ValueError(f"重复的 {kind} 配对键 {key}: {index[key]} / {path}")
+        index[key] = path
+
+    missing_targets = sorted(set(sources) - set(targets))
+    missing_sources = sorted(set(targets) - set(sources))
+    if missing_targets or missing_sources:
+        details = []
+        if missing_targets:
+            details.append(f"缺少 {target_suffix} 文件 {len(missing_targets)} 个，例如 {missing_targets[:3]}")
+        if missing_sources:
+            details.append(f"缺少 {input_suffix} 文件 {len(missing_sources)} 个，例如 {missing_sources[:3]}")
+        raise ValueError("；".join(details))
+    if not sources:
+        raise ValueError(
+            f"目录中没有找到 {input_suffix} / {target_suffix} 图片对：{root}"
+        )
+    return [Pair(sources[key], targets[key]) for key in sorted(sources)]
+
+
 def manifest_pairs(path: Path) -> list[Pair]:
     base = path.parent
     rows: list[dict]
@@ -131,11 +181,20 @@ def manifest_pairs(path: Path) -> list[Pair]:
 
 
 def collect_pairs(args: argparse.Namespace) -> tuple[list[Pair], list[Pair]]:
-    modes = sum(bool(x) for x in (args.manifest, args.input_dir or args.target_dir, args.input or args.target))
+    modes = sum(bool(x) for x in (
+        args.manifest,
+        args.pair_dir,
+        args.input_dir or args.target_dir,
+        args.input or args.target,
+    ))
     if modes > 1:
-        raise ValueError("--manifest、目录模式和单图模式只能选择一种")
+        raise ValueError("--manifest、--pair-dir、双目录模式和单图模式只能选择一种")
     if args.manifest:
         pairs = manifest_pairs(Path(args.manifest))
+    elif args.pair_dir:
+        pairs = paired_directory_pairs(
+            Path(args.pair_dir), args.input_suffix, args.target_suffix, args.recursive
+        )
     elif args.input_dir or args.target_dir:
         if not args.input_dir or not args.target_dir:
             raise ValueError("--input-dir 和 --target-dir 必须同时提供")
@@ -145,7 +204,7 @@ def collect_pairs(args: argparse.Namespace) -> tuple[list[Pair], list[Pair]]:
             raise ValueError("--input 和 --target 必须同时提供")
         pairs = [Pair(Path(args.input), Path(args.target), "train")]
     else:
-        raise ValueError("请提供单图参数、目录参数或 --manifest")
+        raise ValueError("请提供单图参数、目录参数、--pair-dir 或 --manifest")
     if not pairs:
         raise ValueError("没有找到可训练的图片对")
 
@@ -302,6 +361,11 @@ def parse_args() -> argparse.Namespace:
     source.add_argument("--target", help="single aligned CMYK target image")
     source.add_argument("--input-dir", help="training RGB directory")
     source.add_argument("--target-dir", help="training CMYK directory")
+    source.add_argument(
+        "--pair-dir", help="directory containing xxx_input.* / xxx_target.* pairs"
+    )
+    source.add_argument("--input-suffix", default="_input")
+    source.add_argument("--target-suffix", default="_target")
     source.add_argument("--manifest", help="CSV/JSONL with input,target[,split]")
     source.add_argument("--val-input-dir", help="optional validation RGB directory")
     source.add_argument("--val-target-dir", help="optional validation CMYK directory")
