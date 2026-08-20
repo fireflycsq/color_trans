@@ -244,7 +244,23 @@ python3 train_portrait_skin.py \
 
 `--region person` 是默认值。若只要皮肤、不改头发和服装，可改为 `--region skin`。
 
-`test.py` / `server.py` 会自动启用写入 `.npz` 的人像阶段。可用 `--save-portrait-mask mask.png` 检查是否套住整个人。训练和推理必须都能做人像分割。
+训练前先看遮罩是否套住头发和服装。四联预览从左到右是原图、青色叠加、棋盘格抠图、热力遮罩（黄线是训练阈值 0.45 的轮廓）：
+
+```bash
+python3 visualize_portrait_mask.py \
+  --input /path/to/photo.jpg \
+  --output-dir mask_previews \
+  --region person
+
+python3 visualize_portrait_mask.py \
+  --input-dir dataset/pairs \
+  --output-dir mask_previews \
+  --region person
+```
+
+看叠加和抠出图：头发、衣服被青色盖住就对了；轮廓切进脸、漏掉袖子或把背景算进人，说明分割不准。目录模式会额外写出 `mask_preview_report.csv`。`test.py` 的 `--save-portrait-mask` 只存灰阶遮罩，不方便审边缘。
+
+`test.py` / `server.py` 会自动启用写入 `.npz` 的人像阶段。训练和推理必须都能做人像分割。
 
 ## 推理与测试
 
