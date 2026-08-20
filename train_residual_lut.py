@@ -52,7 +52,7 @@ def sample_residual(
 
 def splat(
     sums: np.ndarray, weights: np.ndarray, rgb: np.ndarray, residual: np.ndarray,
-    sample_weights: np.ndarray,
+    sample_weights: np.ndarray, sum_sq: np.ndarray | None = None,
 ) -> None:
     """Trilinearly distribute samples into their eight neighbouring nodes."""
     size = sums.shape[0]
@@ -72,6 +72,8 @@ def splat(
                 w = wr * wg * wb * sample_weights
                 np.add.at(weights, (ir, ig, ib), w)
                 np.add.at(sums, (ir, ig, ib), residual * w[:, None])
+                if sum_sq is not None:
+                    np.add.at(sum_sq, (ir, ig, ib), np.square(residual) * w[:, None])
 
 
 def accumulate(

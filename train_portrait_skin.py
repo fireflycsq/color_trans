@@ -39,6 +39,19 @@ from train_residual_lut import (
 )
 
 
+def node_agreement(
+    sum_sq: np.ndarray, weights: np.ndarray, mean: np.ndarray, sigma_255: float,
+) -> np.ndarray:
+    """Per-node agreement in [0, 1]; high residual variance across photos lowers it."""
+    sigma = max(float(sigma_255) / 255.0, 1e-8)
+    var = np.divide(
+        sum_sq, weights[..., None], out=np.zeros_like(sum_sq), where=weights[..., None] > 0,
+    )
+    var -= np.square(mean)
+    std = np.sqrt(np.maximum(var, 0.0)).max(axis=-1)
+    return (1.0 / (1.0 + std / sigma)).astype(np.float32)
+
+
 def sample_portrait_residual(
     pair: Pair, count: int, seed: int, transform, lut: np.ndarray, confidence: np.ndarray,
     mask_threshold: float = 0.45, region: str = "person",
@@ -67,9 +80,10 @@ def accumulate_portrait(
     transform, lut: np.ndarray, confidence: np.ndarray, clip: np.ndarray,
     reference: np.ndarray | None = None, huber_delta: float = 32 / 255,
     mask_threshold: float = 0.45, region: str = "person",
-) -> tuple[np.ndarray, np.ndarray, int, int, dict]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, int, dict]:
     sums = np.zeros((size, size, size, 4), dtype=np.float64)
     weights = np.zeros((size, size, size), dtype=np.float64)
+    sum_sq = np.zeros((size, size, size, 4), dtype=np.float64)
     budget = sample_budget(len(pairs), per_image, maximum)
     total = 0
     used = 0
@@ -95,7 +109,7 @@ def accumulate_portrait(
         if reference is not None:
             deviation = np.max(np.abs(residual - trilinear_lookup(reference, rgb)), axis=1)
             robust = np.minimum(1.0, huber_delta / np.maximum(deviation, 1e-8))
-        splat(sums, weights, rgb, residual, robust)
+        splat(sums, weights, rgb, residual, robust, sum_sq if reference is None else None)
         total += len(rgb)
         used += 1
         print(
@@ -110,7 +124,7 @@ def accumulate_portrait(
         "samples": total,
         "pairs_with_portrait": used,
     }
-    return sums, weights, total, used, stats
+    return sums, weights, sum_sq, total, used, stats
 
 
 def evaluate_portrait(
@@ -143,30 +157,39 @@ def evaluate_portrait(
         prediction = np.clip(global_pred + skin_corr, 0, 1)
         pair_global = metric_summary(global_pred, target, icc)
         pair_model = metric_summary(prediction, target, icc)
+        delta = pair_model["delta_e76"]["mean"] - pair_global["delta_e76"]["mean"]
         per_pair.append({
             "name": pair.name, "samples": len(rgb),
             "global_delta_e76_mean": pair_global["delta_e76"]["mean"],
             "portrait_delta_e76_mean": pair_model["delta_e76"]["mean"],
+            "delta_e76_change": delta,
             "portrait_cmyk_mae": pair_model["cmyk_mae"],
         })
         globals_.append(global_pred)
         predictions.append(prediction)
         targets.append(target)
+        flag = " WORSE" if delta > 0.02 else ""
         print(
             f"[{label} {i:>4}/{len(pairs)}] {pair.name}: "
             f"global ΔE={pair_global['delta_e76']['mean']:.3f}, "
-            f"portrait ΔE={pair_model['delta_e76']['mean']:.3f}"
+            f"portrait ΔE={pair_model['delta_e76']['mean']:.3f}, "
+            f"Δ={delta:+.3f}{flag}"
         )
     if not targets:
         return None
     global_metrics = metric_summary(np.concatenate(globals_), np.concatenate(targets), icc)
     model_metrics = metric_summary(np.concatenate(predictions), np.concatenate(targets), icc)
     base_de, model_de = global_metrics["delta_e76"]["mean"], model_metrics["delta_e76"]["mean"]
-    per_pair.sort(key=lambda x: x["portrait_delta_e76_mean"], reverse=True)
+    n_worse = sum(1 for x in per_pair if x["delta_e76_change"] > 0.02)
+    n_better = sum(1 for x in per_pair if x["delta_e76_change"] < -0.02)
+    n_same = len(per_pair) - n_worse - n_better
+    print(f"[{label}] better={n_better} worse={n_worse} same={n_same}")
+    per_pair.sort(key=lambda x: x["delta_e76_change"], reverse=True)
     return {
         "pairs": len(per_pair), "samples": sum(len(x) for x in targets),
         "global_only": global_metrics, "global_plus_portrait": model_metrics,
         "delta_e76_improvement_percent": float(100 * (base_de - model_de) / base_de) if base_de else 0.0,
+        "pairs_better": n_better, "pairs_worse": n_worse, "pairs_same": n_same,
         "worst_pairs": per_pair[:min(20, len(per_pair))],
     }
 
@@ -200,6 +223,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-cmy-residual", type=float, default=255.0)
     p.add_argument("--max-k-residual", type=float, default=255.0)
     p.add_argument("--mask-threshold", type=float, default=0.45)
+    p.add_argument(
+        "--agreement-sigma", type=float, default=8.0,
+        help="CMYK residual std (0-255) that halves node confidence; lower is more conservative",
+    )
     p.add_argument(
         "--region", choices=("person", "skin"), default="person",
         help="person: 整个人像含头发和服装（默认）；skin: 仅皮肤",
@@ -238,7 +265,7 @@ def main() -> None:
 
     transform = build_to_cmyk(target_icc)
     clip = np.array([args.max_cmy_residual] * 3 + [args.max_k_residual], dtype=np.float32) / 255
-    sums, weights, train_samples, used, residual_stats = accumulate_portrait(
+    sums, weights, sum_sq, train_samples, used, residual_stats = accumulate_portrait(
         train_pairs, args.grid_size, args.samples_per_image, args.max_samples,
         args.seed, transform, loaded.lut, loaded.confidence, clip,
         mask_threshold=args.mask_threshold, region=args.region,
@@ -250,18 +277,29 @@ def main() -> None:
         + ", ".join(f"{x:.1f}" for x in residual_stats["mean_abs_255"])
         + f" | pairs with portrait: {used}/{len(train_pairs)}"
     )
+    pass1_mean = np.divide(
+        sums, weights[..., None], out=np.zeros_like(sums), where=weights[..., None] > 0,
+    )
+    agreement = node_agreement(sum_sq, weights, pass1_mean, args.agreement_sigma)
     initial_lut, _ = finish_lut(
         sums, weights, args.confidence_samples, args.smoothness,
         args.baseline_regularization, args.smooth_iterations, clip,
     )
-    sums, weights, train_samples, used, _ = accumulate_portrait(
+    sums, weights, _, train_samples, used, _ = accumulate_portrait(
         train_pairs, args.grid_size, args.samples_per_image, args.max_samples,
         args.seed, transform, loaded.lut, loaded.confidence, clip,
         initial_lut, args.huber_delta / 255, args.mask_threshold, args.region,
     )
-    skin_lut, skin_confidence = finish_lut(
+    skin_lut, coverage = finish_lut(
         sums, weights, args.confidence_samples, args.smoothness,
         args.baseline_regularization, args.smooth_iterations, clip,
+    )
+    skin_confidence = (coverage * agreement).astype(np.float32)
+    covered = weights > 0
+    print(
+        f"portrait node agreement mean={float(agreement[covered].mean()) if np.any(covered) else 0:.3f} "
+        f"| coverage mean={float(coverage.mean()):.3f} "
+        f"| gated confidence mean={float(skin_confidence.mean()):.3f}"
     )
 
     train_metrics = evaluate_portrait(
@@ -289,6 +327,8 @@ def main() -> None:
         "portrait_smoothness": args.smoothness,
         "portrait_baseline_regularization": args.baseline_regularization,
         "portrait_huber_delta_255": args.huber_delta,
+        "portrait_agreement_sigma_255": args.agreement_sigma,
+        "portrait_mean_node_agreement": float(agreement[covered].mean()) if np.any(covered) else 0.0,
         "portrait_residual_limits_255": [args.max_cmy_residual] * 3 + [args.max_k_residual],
         "portrait_mask_threshold": args.mask_threshold,
         "portrait_residual_stats": residual_stats,
@@ -327,6 +367,10 @@ def main() -> None:
         print(f"portrait val ΔE76 global mean/p95: {before['mean']:.3f} / {before['p95']:.3f}")
         print(f"portrait val ΔE76 +skin mean/p95: {after['mean']:.3f} / {after['p95']:.3f}")
         print(f"portrait val mean improvement: {val_metrics['delta_e76_improvement_percent']:.2f}%")
+        print(
+            f"portrait val pairs better/worse/same: "
+            f"{val_metrics['pairs_better']}/{val_metrics['pairs_worse']}/{val_metrics['pairs_same']}"
+        )
 
 
 if __name__ == "__main__":
