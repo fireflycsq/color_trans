@@ -11,6 +11,7 @@ from PIL import Image
 
 from color_model import image_to_srgb, load_color_model, render_cmyk_to_srgb, srgb_to_lab
 from residual_lut_model import ResidualLUTModel, edge_lift_amounts, shadow_lift_amounts
+from adaptive_lut_model import AdaptiveLUTModel
 from portrait_mask import portrait_mask, portrait_region_from_metadata
 
 
@@ -67,9 +68,13 @@ def main() -> None:
         save_args.update(quality=args.quality, subsampling=0)
     pred.save(out, **save_args)
     extras = []
+    if isinstance(model, AdaptiveLUTModel):
+        extras.append("adaptive RGB LUT")
+        if model.portrait_encoder is not None:
+            extras.append(f"portrait-{model.portrait_region} on")
     if getattr(model, "skin_lut", None) is not None:
         extras.append(f"portrait-{portrait_region_from_metadata(model.metadata)} on")
-    if isinstance(model, ResidualLUTModel):
+    if isinstance(model, (ResidualLUTModel, AdaptiveLUTModel)):
         k_lift, c_lift = edge_lift_amounts(model.metadata, args.edge_lift)
         if k_lift > 0 or c_lift > 0:
             extras.append(f"edge-lift K={k_lift:g} C={c_lift:g}")

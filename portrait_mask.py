@@ -34,7 +34,11 @@ def detector_name(region: str = "person") -> str:
     if region == "skin" and not has_person_segmenter():
         return "ycbcr_skin"
     if has_person_segmenter():
-        return "mediapipe_selfie" if region == "person" else "mediapipe_selfie+ycbcr_skin"
+        if region == "person":
+            return "mediapipe_selfie"
+        if region == "contour":
+            return "mediapipe_selfie+contour"
+        return "mediapipe_selfie+ycbcr_skin"
     return "unavailable"
 
 
@@ -238,9 +242,12 @@ def _blur_mask(mask: np.ndarray, blur_radius: float) -> np.ndarray:
 def portrait_mask(
     rgb_u8: np.ndarray, blur_radius: float = 4.0, region: str = "person",
 ) -> np.ndarray:
-    """Soft portrait mask. ``region`` is ``person`` (default) or ``skin``."""
-    if region not in {"person", "skin"}:
-        raise ValueError("region 必须是 person 或 skin")
+    """Soft portrait mask. ``region`` is ``person`` (default), ``skin``, or ``contour``."""
+    if region not in {"person", "skin", "contour"}:
+        raise ValueError("region 必须是 person、skin 或 contour")
+    if region == "contour":
+        mask = person_probability(rgb_u8)
+        return portrait_edge_weight(_blur_mask(mask, blur_radius))
     if region == "person":
         mask = person_probability(rgb_u8)
     else:
@@ -251,10 +258,40 @@ def portrait_mask(
     return _blur_mask(mask, blur_radius)
 
 
+def portrait_bbox(
+    mask: np.ndarray, threshold: float = 0.45, pad: float = 0.12,
+) -> tuple[int, int, int, int] | None:
+    """Inclusive-exclusive box (x0, y0, x1, y1) around the portrait mask."""
+    ys, xs = np.nonzero(np.asarray(mask) >= threshold)
+    if xs.size < _MIN_PERSON_PIXELS:
+        return None
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    height, width = mask.shape[:2]
+    pad_y = max(1, int((y1 - y0) * pad))
+    pad_x = max(1, int((x1 - x0) * pad))
+    return (
+        max(0, x0 - pad_x), max(0, y0 - pad_y),
+        min(width, x1 + pad_x), min(height, y1 + pad_y),
+    )
+
+
+def portrait_crop(
+    rgb_u8: np.ndarray, mask: np.ndarray, size: int = 256, threshold: float = 0.45,
+) -> Image.Image | None:
+    """Square RGB thumbnail of the person box, for the portrait encoder."""
+    box = portrait_bbox(mask, threshold)
+    if box is None:
+        return None
+    x0, y0, x1, y1 = box
+    crop = Image.fromarray(np.asarray(rgb_u8[y0:y1, x0:x1], dtype=np.uint8), "RGB")
+    return crop.resize((size, size), Image.Resampling.BILINEAR)
+
+
 def portrait_region_from_metadata(metadata: dict | None) -> str:
     meta = metadata or {}
     region = str(meta.get("portrait_region", "")).lower()
-    if region in {"person", "skin"}:
+    if region in {"person", "skin", "contour"}:
         return region
     if meta.get("portrait_skin"):
         return "skin"

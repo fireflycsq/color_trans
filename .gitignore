@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 *.npz
 !5D2A8056_model.npz
+*.pt
+*.pth
 *.tif
 *.tiff
 *_preview.jpg

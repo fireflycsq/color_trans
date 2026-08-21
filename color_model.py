@@ -171,7 +171,11 @@ class ColorModel:
 
 
 def load_color_model(path: str | Path):
-    """Load either the legacy polynomial model or a residual-LUT model."""
+    """Load a polynomial, residual-LUT, or adaptive RGB-LUT model."""
+    path = Path(path)
+    if path.suffix.lower() in {".pt", ".pth"}:
+        from adaptive_lut_model import AdaptiveLUTModel
+        return AdaptiveLUTModel.load(path)
     with np.load(path, allow_pickle=False) as z:
         is_lut = "lut" in z.files
     if is_lut:

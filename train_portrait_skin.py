@@ -4,6 +4,9 @@
 Stage 1 grades the whole image. Stage 2 learns target_CMYK − global_CMYK
 inside a cut-out person mask (skin, hair, and clothing by default), then
 inference applies that correction only on the person.
+
+``--region contour`` is an experiment: sample only the silhouette ring,
+not the full frame or the person interior.
 """
 
 from __future__ import annotations
@@ -56,7 +59,7 @@ def sample_portrait_residual(
     pair: Pair, count: int, seed: int, transform, lut: np.ndarray, confidence: np.ndarray,
     mask_threshold: float = 0.45, region: str = "person",
 ) -> tuple[np.ndarray, np.ndarray, float] | None:
-    """RGB and target-minus-global-CMYK residual on portrait pixels."""
+    """RGB and target-minus-global-CMYK residual on portrait or contour pixels."""
     with Image.open(pair.source) as source:
         rgb_u8 = np.asarray(image_to_srgb(source), dtype=np.uint8)
     with Image.open(pair.target) as target:
@@ -144,6 +147,8 @@ def apply_portrait_defaults(args: argparse.Namespace) -> None:
         args.max_cmy_residual = 255.0
     if args.max_k_residual is None:
         args.max_k_residual = 255.0
+    if args.mask_threshold is None:
+        args.mask_threshold = 0.5 if args.region == "contour" else 0.45
 
 
 def evaluate_portrait(
@@ -241,15 +246,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--huber-delta", type=float, default=None)
     p.add_argument("--max-cmy-residual", type=float, default=None)
     p.add_argument("--max-k-residual", type=float, default=None)
-    p.add_argument("--mask-threshold", type=float, default=0.45)
+    p.add_argument("--mask-threshold", type=float, default=None)
     p.add_argument("--agreement-sigma", type=float, default=None)
     p.add_argument(
         "--fit-human", action=argparse.BooleanOptionalAction, default=True,
         help="follow target portrait CMYK closely (default). Use --no-fit-human for safer fallback",
     )
     p.add_argument(
-        "--region", choices=("person", "skin"), default="person",
-        help="person: 整个人像含头发和服装（默认）；skin: 仅皮肤",
+        "--region", choices=("person", "skin", "contour"), default="person",
+        help="person: 整个人像; skin: 仅皮肤; contour: 只采样轮廓环（实验，不全图采样）",
     )
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
@@ -269,7 +274,7 @@ def main() -> None:
     loaded = load_color_model(args.model)
     if not isinstance(loaded, ResidualLUTModel):
         raise ValueError("人像阶段需要残差 LUT 模型，不能用旧多项式模型")
-    if args.region == "person":
+    if args.region in {"person", "contour"}:
         require_person_segmenter()
 
     train_pairs, val_pairs = collect_pairs(args)
@@ -279,6 +284,7 @@ def main() -> None:
         f"region={args.region} | detector={detector_name(args.region)} | "
         f"agreement_sigma={args.agreement_sigma:g} huber={args.huber_delta:g} "
         f"smoothness={args.smoothness:g} baseline_reg={args.baseline_regularization:g}"
+        + (" | contour-only samples (no full-image / person-interior)" if args.region == "contour" else "")
     )
     if args.target_icc:
         fixed_icc = load_fixed_target_icc(Path(args.target_icc))
@@ -299,6 +305,8 @@ def main() -> None:
         mask_threshold=args.mask_threshold, region=args.region,
     )
     if train_samples == 0:
+        if args.region == "contour":
+            raise ValueError("训练集里没有足够的人像轮廓像素，无法训练轮廓实验")
         raise ValueError("训练集里没有检测人人像像素，无法训练第二阶段")
     print(
         f"{args.region} |ΔCMYK vs global| mean: "
@@ -360,13 +368,14 @@ def main() -> None:
         "portrait_agreement_sigma_255": args.agreement_sigma,
         "portrait_mean_node_agreement": float(agreement[covered].mean()) if np.any(covered) else 0.0,
         "portrait_residual_limits_255": [args.max_cmy_residual] * 3 + [args.max_k_residual],
+        "portrait_experiment": "contour_only" if args.region == "contour" else None,
         "portrait_mask_threshold": args.mask_threshold,
         "portrait_residual_stats": residual_stats,
         "portrait_embedded_target_icc_status": status,
         "portrait_created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "skin_residual_strength": 1.0,
-        "edge_lift": 0.05,
-        "edge_lift_c": 0.02,
+        "edge_lift": 0.0 if args.region == "contour" else 0.05,
+        "edge_lift_c": 0.0 if args.region == "contour" else 0.02,
         "shadow_lift": 0.06,
         "shadow_lift_cmy": 0.035,
         "portrait_lut_nodes_with_samples": int(np.count_nonzero(weights)),

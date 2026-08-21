@@ -163,8 +163,8 @@ def parse_args() -> argparse.Namespace:
     source.add_argument("--input", help="single image")
     source.add_argument("--input-dir", help="directory of images")
     p.add_argument("--output-dir", required=True)
-    p.add_argument("--region", choices=("person", "skin"), default="person")
-    p.add_argument("--threshold", type=float, default=0.45, help="same cutoff used in training")
+    p.add_argument("--region", choices=("person", "skin", "contour"), default="person")
+    p.add_argument("--threshold", type=float, default=None, help="same cutoff used in training")
     p.add_argument("--blur-radius", type=float, default=4.0)
     p.add_argument("--max-dimension", type=int, default=1600)
     p.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
@@ -174,6 +174,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.threshold is None:
+        args.threshold = 0.5 if args.region == "contour" else 0.45
     if not 0 < args.threshold <= 1:
         raise ValueError("--threshold 必须在 (0, 1] 范围")
     if args.max_dimension < 64:

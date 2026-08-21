@@ -1,6 +1,58 @@
 # RGB → 印刷 CMYK 调色模型
 
-这个项目从像素级对齐的 RGB 输入与 CMYK 目标图中学习印刷调色方向。它同时提供原有三阶多项式模型，以及更稳健的“固定 ICC 基线 + 3D CMYK 残差 LUT”，并把目标印刷 ICC 嵌入模型和输出文件。
+这个项目从像素级对齐的 RGB 输入与 CMYK 目标图中学习印刷调色方向。推荐路径是 **场景自适应 RGB LUT → ICC → CMYK**，并由小 CNN 分别编码全图和人像裁切。原有三阶多项式、以及“固定 ICC + CMYK 残差 LUT”仍可加载。
+
+## 推荐：自适应 RGB LUT
+
+```text
+Input RGB
+    ├─ Global Encoder (Small CNN) → Global LUT + Confidence
+    └─ MediaPipe Person/Skin → Portrait Crop → Portrait Encoder → Portrait LUT
+         ↓
+    Corrected RGB → ICC → CMYK → edge-lift / shadow-lift → Final CMYK
+```
+
+全图 CNN 看 256×256 缩略图，生成 17³ RGB 残差 LUT 和置信度，作用在整张图上。人像分支用 MediaPipe 抠人（或皮肤），把人像框缩放到 256×256 再编码一张 LUT，只在遮罩内与全局结果混合。ICC 不可微，所以训练损失是人工 CMYK 的软打样 RGB；推理仍先改 RGB，再转到印刷 CMYK。K 版由 ICC 的 GCR 决定，不会再学人工分色。
+
+需要 PyTorch：
+
+```bash
+python3 -m pip install torch
+python3 -m pip install mediapipe   # 人像阶段
+```
+
+先训全局，再训人像：
+
+```bash
+python3 train_adaptive_lut.py \
+  --stage global \
+  --pair-dir dataset/pairs \
+  --target-icc profiles/PSOcoated_v3.icc \
+  --model models/adaptive_global.pt \
+  --val-ratio 0.1 \
+  --epochs 6
+
+python3 train_adaptive_lut.py \
+  --stage portrait \
+  --region person \
+  --pair-dir dataset/pairs \
+  --target-icc profiles/PSOcoated_v3.icc \
+  --model models/adaptive_global.pt \
+  --output models/adaptive_portrait.pt \
+  --val-ratio 0.1 \
+  --epochs 6
+```
+
+`--region skin` 只在皮肤上混合人像 LUT。`test.py` / `server.py` 直接加载 `.pt`：
+
+```bash
+python3 test.py \
+  --model models/adaptive_portrait.pt \
+  --input in.jpg \
+  --output result.tif
+```
+
+`--edge-lift` 和 `--shadow-lift` 仍作用在最终 CMYK 上，默认与之前相同。旧的 `.npz` 残差 LUT 模型可以继续用。
 
 ## 训练
 
@@ -157,7 +209,7 @@ python3 train.py \
 
 `--target-icc` 的含义是“统一指定解释”，不是把其他 CMYK 空间转换到该 ICC。如果图片实际来自不同印刷空间，应先完成 CMYK→CMYK 色彩管理转换，再进行训练。
 
-## ICC 基线 + 3D 残差 LUT（推荐）
+## ICC 基线 + 3D 残差 LUT（旧路径）
 
 这套模型先用固定目标 ICC 计算标准 CMYK，再用 3D LUT 只预测人工目标相对标准结果的 `ΔC/ΔM/ΔY/ΔK`：
 
@@ -244,6 +296,28 @@ python3 train_portrait_skin.py \
 ```
 
 `--region person` 是默认值。若只要皮肤、不改头发和服装，可改为 `--region skin`。人像阶段默认 `--fit-human`：残差满量程、较弱平滑、一致性降权更松，让第二层尽量跟上人工对人像的改法。已有按保守参数训练的人像 `.npz` 不会自动变激进，需要重训。若验证集上变差的图明显变多，再用 `--no-fit-human` 或把 `--agreement-sigma` 降到 `8`。
+
+### 轮廓采样实验
+
+若只想学发丝/衣缘的人工方向，不要把整图或人像内部写进第二层，用 `--region contour`。只在人像遮罩约 50% 的那一圈采样（`target − 全局`），推理时也只把这层加在轮廓环上，脸和衣服内部、背景仍走全局 LUT。不跑全图像素采样。轮廓实验默认关掉启发式 `--edge-lift`，避免和学习到的轮廓残差叠在一起：
+
+```bash
+python3 train_portrait_skin.py \
+  --model models/residual_lut_human.npz \
+  --pair-dir dataset/pairs \
+  --region contour \
+  --fit-human \
+  --output models/residual_lut_human_contour.npz \
+  --report models/residual_lut_human_contour.portrait.report.json \
+  --val-ratio 0.1
+
+python3 visualize_portrait_mask.py \
+  --input-dir dataset/pairs \
+  --output-dir mask_previews_contour \
+  --region contour
+```
+
+预览里青色应是一圈轮廓，不应铺满整个人。训练阈值默认 `0.5`（环更窄）；仍偏宽可把 `--mask-threshold` 提到 `0.7`。此实验仍需要已经训好的全局模型，只是第二层不再从全图/全身采样。
 
 训练前先看遮罩是否套住头发和服装。四联预览从左到右是原图、青色叠加、棋盘格抠图、热力遮罩（黄线是训练阈值 0.45 的轮廓）：
 

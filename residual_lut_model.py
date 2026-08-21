@@ -161,11 +161,12 @@ class ResidualLUTModel:
         k_lift, c_lift = edge_lift_amounts(self.metadata, edge_lift)
         shadow_k, shadow_cmy = shadow_lift_amounts(self.metadata, shadow_lift)
         portrait = None
+        region = portrait_region_from_metadata(self.metadata)
         rgb_u8_full = np.asarray(source, dtype=np.uint8)
         if self.skin_lut is not None:
-            region = portrait_region_from_metadata(self.metadata)
             portrait = portrait_mask(rgb_u8_full, region=region)
         elif (k_lift > 0 or c_lift > 0) and has_person_segmenter():
+            region = "person"
             portrait = portrait_mask(rgb_u8_full, region="person")
         for y in range(0, height, chunk_rows):
             chunk = source.crop((0, y, width, min(y + chunk_rows, height)))
@@ -184,7 +185,7 @@ class ResidualLUTModel:
                         mask * portrait_strength * extra_confidence
                     )[..., None] * extra
                 if k_lift > 0 or c_lift > 0:
-                    edge = portrait_edge_weight(mask)
+                    edge = mask if region == "contour" else portrait_edge_weight(mask)
                     if c_lift > 0:
                         predicted[..., 0] -= edge * c_lift
                     if k_lift > 0:
