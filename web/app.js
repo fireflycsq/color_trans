@@ -17,8 +17,28 @@ function addLocalQueue(file){const row=document.createElement('div');row.classNa
 function startPolling(){clearInterval(state.poll);refreshQueue();state.poll=setInterval(refreshQueue,1200)}
 async function refreshQueue(){if(!state.batchId)return;try{const b=await api(`/api/batches/${state.batchId}`);state.batch=b;$('#profileName').textContent=b.target_profile||'模型就绪';$('#queue').innerHTML=b.images.map(i=>`<div class="queue-item"><img class="queue-thumb" src="/media/${b.id}/${i.id}/input/file"><div><div class="queue-name">${escapeHtml(i.filename)}</div><div class="queue-state">${i.error?escapeHtml(i.error):labels[i.process_status]}</div></div><div class="state-icon ${i.process_status==='completed'?'done':i.process_status==='failed'?'fail':'spinner'}">${i.process_status==='completed'?'✓':i.process_status==='failed'?'!':'◌'}</div></div>`).join('');if(b.counts.processing===0){clearInterval(state.poll);$('#reviewButton').classList.remove('hidden');$('#startButton').disabled=false;loadBatches()}}catch(e){clearInterval(state.poll);toast(e.message)}}
 $('#reviewButton').onclick=()=>location.hash=`review?batch=${state.batchId}`;$('#backButton').onclick=()=>location.hash='upload';
+$('#deleteBatchButton').onclick=async()=>{if(!state.batchId||!state.batch)return;try{await deleteBatch(state.batchId,state.batch.name)}catch(e){toast(e.message)}};
 
-async function loadBatches(){try{const batches=await api('/api/batches');$('#batchList').innerHTML=batches.length?batches.map(b=>`<article class="batch-card" data-id="${b.id}"><h3>${escapeHtml(b.name)}</h3><p class="muted">${b.target_profile||'CMYK'} · ${b.counts.total} 张图片</p><div class="mini-progress"><span style="width:${b.counts.total?b.counts.completed/b.counts.total*100:0}%"></span></div><div class="batch-card-footer"><span>${new Date(b.created_at).toLocaleString()}</span><span>${b.counts.approved} 已通过 →</span></div></article>`).join(''):'<p class="muted">还没有处理批次</p>';document.querySelectorAll('.batch-card').forEach(x=>x.onclick=()=>location.hash=`review?batch=${x.dataset.id}`)}catch(e){toast(e.message)}}
+async function deleteBatch(id, name){
+  const label=name||'该批次';
+  if(!confirm(`确定删除「${label}」？原图、调色结果和审核记录都会从本机删除，无法恢复。`))return;
+  await api(`/api/batches/${id}`,{method:'DELETE'});
+  if(state.batchId===id){
+    clearInterval(state.poll);
+    state.poll=null;
+    state.batchId=null;
+    state.batch=null;
+    $('#queue').classList.add('hidden');
+    $('#queue').innerHTML='';
+    $('#emptyQueue').classList.remove('hidden');
+    $('#reviewButton').classList.add('hidden');
+    $('#startButton').disabled=false;
+    if(location.hash.startsWith('#review'))location.hash='upload';
+  }
+  await loadBatches();
+  toast('批次已删除');
+}
+async function loadBatches(){try{const batches=await api('/api/batches');$('#batchList').innerHTML=batches.length?batches.map(b=>`<article class="batch-card" data-id="${b.id}"><h3>${escapeHtml(b.name)}</h3><p class="muted">${b.target_profile||'CMYK'} · ${b.counts.total} 张图片</p><div class="mini-progress"><span style="width:${b.counts.total?b.counts.completed/b.counts.total*100:0}%"></span></div><div class="batch-card-footer"><span>${new Date(b.created_at).toLocaleString()}</span><div class="batch-card-actions"><span>${b.counts.approved} 已通过</span><button type="button" class="batch-delete" data-id="${b.id}" data-name="${escapeAttr(b.name)}">删除</button></div></div></article>`).join(''):'<p class="muted">还没有处理批次</p>';document.querySelectorAll('.batch-card').forEach(x=>x.onclick=()=>location.hash=`review?batch=${x.dataset.id}`);document.querySelectorAll('.batch-delete').forEach(btn=>btn.onclick=async e=>{e.stopPropagation();try{await deleteBatch(btn.dataset.id,btn.dataset.name)}catch(err){toast(err.message)}})}catch(e){toast(e.message)}}
 $('#refreshBatches').onclick=loadBatches;
 
 async function openReview(id){state.batchId=id;try{const b=await api(`/api/batches/${id}`);state.batch=b;const protection=b.max_hue_shift>0?` · 色相保护 ±${b.max_hue_shift}°`:'';$('#reviewTitle').textContent=b.name;$('#reviewMeta').textContent=`${b.target_profile}${protection} · 创建于 ${new Date(b.created_at).toLocaleString()}`;$('#profileName').textContent=b.target_profile;$('#downloadButton').href=`/api/batches/${id}/download?status=approved`;renderStats(b.counts);renderReview()}catch(e){toast(e.message)}}
@@ -30,5 +50,6 @@ async function uploadTarget(id,file){try{if(file.size>state.maxUploadBytes)throw
 async function reviewItem(id,status,note){try{const item=state.batch.images.find(x=>x.id===id);await api(`/api/batches/${state.batch.id}/${id}/review`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({status,note:note??item.note})});await openReview(state.batch.id);toast(status==='approved'?'已标记为通过':status==='rejected'?'已标记为驳回':'备注已保存')}catch(e){toast(e.message)}}
 $('#statusFilter').onchange=renderReview;
 function escapeHtml(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
+function escapeAttr(s){return escapeHtml(s).replaceAll('"','&quot;')}
 async function loadConfig(){try{const c=await api('/api/config');state.maxUploadBytes=c.max_upload_bytes;state.maxUploadMb=c.max_upload_mb;$('#uploadHint').textContent=`可一次选择多张，单张不超过 ${c.max_upload_mb} MB`}catch(e){toast(e.message)}}
 window.addEventListener('hashchange',route);loadConfig();loadBatches();route();

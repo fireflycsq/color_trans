@@ -194,13 +194,27 @@ class AppState:
                 process_status="completed",
                 processed_at=utc_now(),
             )
+        except FileNotFoundError:
+            return
         except Exception as exc:
-            self.update_item(batch_id, image_id, process_status="failed", error=str(exc))
+            try:
+                self.update_item(batch_id, image_id, process_status="failed", error=str(exc))
+            except FileNotFoundError:
+                return
 
     def review(self, batch_id: str, image_id: str, status: str, note: str) -> dict:
         if status not in {"pending", "approved", "rejected"}:
             raise ValueError("非法审核状态")
         return self.update_item(batch_id, image_id, review_status=status, note=note[:500])
+
+    def delete_batch(self, batch_id: str) -> dict:
+        """Remove a batch directory and all of its uploaded/processed files."""
+        root = self.batch_dir(batch_id)
+        with self.lock:
+            if not self.manifest_path(batch_id).exists():
+                raise FileNotFoundError(batch_id)
+            shutil.rmtree(root)
+        return {"ok": True, "id": batch_id}
 
     def add_target_file(
         self, batch_id: str, image_id: str, filename: str, uploaded_path: Path
@@ -440,6 +454,20 @@ class Handler(BaseHTTPRequestHandler):
             self.error_response("图片不存在", 404)
         except (ValueError, json.JSONDecodeError) as exc:
             self.error_response(str(exc), 400)
+
+    def do_DELETE(self) -> None:
+        try:
+            parts = [x for x in urlparse(self.path).path.split("/") if x]
+            if len(parts) != 3 or parts[:2] != ["api", "batches"]:
+                self.send_error(404)
+                return
+            self.json_response(self.app.delete_batch(parts[2]))
+        except FileNotFoundError:
+            self.error_response("批次不存在", 404)
+        except ValueError as exc:
+            self.error_response(str(exc), 400)
+        except Exception as exc:
+            self.error_response(f"服务器错误：{exc}", 500)
 
 
 def main() -> None:
