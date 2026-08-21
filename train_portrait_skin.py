@@ -127,6 +127,25 @@ def accumulate_portrait(
     return sums, weights, sum_sq, total, used, stats
 
 
+def apply_portrait_defaults(args: argparse.Namespace) -> None:
+    """Fill unspecified hyperparameters; default is to follow the human portrait grade."""
+    human = args.fit_human
+    if args.confidence_samples is None:
+        args.confidence_samples = 4.0 if human else 8.0
+    if args.smoothness is None:
+        args.smoothness = 0.02 if human else 0.06
+    if args.baseline_regularization is None:
+        args.baseline_regularization = 0.0 if human else 0.02
+    if args.huber_delta is None:
+        args.huber_delta = 64.0 if human else 32.0
+    if args.agreement_sigma is None:
+        args.agreement_sigma = 48.0 if human else 8.0
+    if args.max_cmy_residual is None:
+        args.max_cmy_residual = 255.0
+    if args.max_k_residual is None:
+        args.max_k_residual = 255.0
+
+
 def evaluate_portrait(
     pairs: list[Pair], global_lut: np.ndarray, global_confidence: np.ndarray,
     skin_lut: np.ndarray, skin_confidence: np.ndarray, icc: bytes,
@@ -215,17 +234,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-samples", type=int, default=1_500_000)
     p.add_argument("--eval-samples-per-image", type=int, default=8_000)
     p.add_argument("--max-eval-samples", type=int, default=250_000)
-    p.add_argument("--confidence-samples", type=float, default=8.0)
-    p.add_argument("--smoothness", type=float, default=0.06)
-    p.add_argument("--baseline-regularization", type=float, default=0.02)
+    p.add_argument("--confidence-samples", type=float, default=None)
+    p.add_argument("--smoothness", type=float, default=None)
+    p.add_argument("--baseline-regularization", type=float, default=None)
     p.add_argument("--smooth-iterations", type=int, default=40)
-    p.add_argument("--huber-delta", type=float, default=32.0)
-    p.add_argument("--max-cmy-residual", type=float, default=255.0)
-    p.add_argument("--max-k-residual", type=float, default=255.0)
+    p.add_argument("--huber-delta", type=float, default=None)
+    p.add_argument("--max-cmy-residual", type=float, default=None)
+    p.add_argument("--max-k-residual", type=float, default=None)
     p.add_argument("--mask-threshold", type=float, default=0.45)
+    p.add_argument("--agreement-sigma", type=float, default=None)
     p.add_argument(
-        "--agreement-sigma", type=float, default=8.0,
-        help="CMYK residual std (0-255) that halves node confidence; lower is more conservative",
+        "--fit-human", action=argparse.BooleanOptionalAction, default=True,
+        help="follow target portrait CMYK closely (default). Use --no-fit-human for safer fallback",
     )
     p.add_argument(
         "--region", choices=("person", "skin"), default="person",
@@ -237,12 +257,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    apply_portrait_defaults(args)
     if not 0 <= args.val_ratio < 1:
         raise ValueError("--val-ratio 必须在 [0, 1) 范围")
     if not 0 < args.mask_threshold <= 1:
         raise ValueError("--mask-threshold 必须在 (0, 1] 范围")
     if args.grid_size < 2:
         raise ValueError("--grid-size 必须至少为 2")
+    if args.agreement_sigma <= 0:
+        raise ValueError("--agreement-sigma 必须大于 0")
     loaded = load_color_model(args.model)
     if not isinstance(loaded, ResidualLUTModel):
         raise ValueError("人像阶段需要残差 LUT 模型，不能用旧多项式模型")
@@ -251,7 +274,12 @@ def main() -> None:
 
     train_pairs, val_pairs = collect_pairs(args)
     print(f"pairs: train={len(train_pairs)}, validation={len(val_pairs)}")
-    print(f"portrait region: {args.region} | detector: {detector_name(args.region)}")
+    print(
+        f"portrait objective: {'fit_human' if args.fit_human else 'safe_fallback'} | "
+        f"region={args.region} | detector={detector_name(args.region)} | "
+        f"agreement_sigma={args.agreement_sigma:g} huber={args.huber_delta:g} "
+        f"smoothness={args.smoothness:g} baseline_reg={args.baseline_regularization:g}"
+    )
     if args.target_icc:
         fixed_icc = load_fixed_target_icc(Path(args.target_icc))
     else:
@@ -294,7 +322,8 @@ def main() -> None:
         sums, weights, args.confidence_samples, args.smoothness,
         args.baseline_regularization, args.smooth_iterations, clip,
     )
-    skin_confidence = (coverage * agreement).astype(np.float32)
+    gate = np.sqrt(np.clip(agreement, 0.0, 1.0)) if args.fit_human else agreement
+    skin_confidence = (coverage * gate).astype(np.float32)
     covered = weights > 0
     print(
         f"portrait node agreement mean={float(agreement[covered].mean()) if np.any(covered) else 0:.3f} "
@@ -315,6 +344,7 @@ def main() -> None:
 
     metadata = dict(loaded.metadata)
     metadata.update({
+        "portrait_fit_human": args.fit_human,
         "portrait_skin": args.region == "skin",
         "portrait_region": args.region,
         "portrait_detector": detector_name(args.region),

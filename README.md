@@ -237,12 +237,13 @@ python3 train_portrait_skin.py \
   --model models/residual_lut_human.npz \
   --pair-dir dataset/pairs \
   --region person \
+  --fit-human \
   --output models/residual_lut_human_portrait.npz \
   --report models/residual_lut_human_portrait.portrait.report.json \
   --val-ratio 0.1
 ```
 
-`--region person` 是默认值。若只要皮肤、不改头发和服装，可改为 `--region skin`。
+`--region person` 是默认值。若只要皮肤、不改头发和服装，可改为 `--region skin`。人像阶段默认 `--fit-human`：残差满量程、较弱平滑、一致性降权更松，让第二层尽量跟上人工对人像的改法。已有按保守参数训练的人像 `.npz` 不会自动变激进，需要重训。若验证集上变差的图明显变多，再用 `--no-fit-human` 或把 `--agreement-sigma` 降到 `8`。
 
 训练前先看遮罩是否套住头发和服装。四联预览从左到右是原图、青色叠加、棋盘格抠图、热力遮罩（黄线是训练阈值 0.45 的轮廓）：
 
