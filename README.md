@@ -17,11 +17,12 @@ Input RGB
 需要 PyTorch：
 
 ```bash
-python3 -m pip install torch
+python3 -m pip install -r requirements.txt
 python3 -m pip install mediapipe   # 人像阶段
+mkdir -p models
 ```
 
-先训全局，再训人像：
+数据配对与下面「数据配对」相同：`--pair-dir`、`--input-dir` / `--target-dir` 或 `--manifest` 均可。必须提供 `--target-icc`。先训全局，再训人像：
 
 ```bash
 python3 train_adaptive_lut.py \
@@ -29,8 +30,21 @@ python3 train_adaptive_lut.py \
   --pair-dir dataset/pairs \
   --target-icc profiles/PSOcoated_v3.icc \
   --model models/adaptive_global.pt \
+  --report models/adaptive_global.report.json \
   --val-ratio 0.1 \
-  --epochs 6
+  --grid-size 17 \
+  --channels 32 \
+  --thumbnail 256 \
+  --epochs 6 \
+  --lr 1e-3 \
+  --samples-per-image 8192 \
+  --max-samples 1500000 \
+  --eval-samples-per-image 4096 \
+  --max-eval-samples 250000 \
+  --huber-delta 0.05 \
+  --lut-l1 0.02 \
+  --smoothness 0.05 \
+  --seed 42
 
 python3 train_adaptive_lut.py \
   --stage portrait \
@@ -39,22 +53,49 @@ python3 train_adaptive_lut.py \
   --target-icc profiles/PSOcoated_v3.icc \
   --model models/adaptive_global.pt \
   --output models/adaptive_portrait.pt \
+  --report models/adaptive_portrait.report.json \
+  --val-ratio 0.1 \
+  --epochs 6 \
+  --lr 1e-3 \
+  --samples-per-image 8192 \
+  --max-samples 1500000 \
+  --mask-threshold 0.45 \
+  --seed 42
+```
+
+人像阶段会冻结全局 CNN，只训人像裁切上的第二张 LUT。`--region skin` 只在皮肤上混合人像 LUT。输入和目标分目录时：
+
+```bash
+python3 train_adaptive_lut.py \
+  --stage global \
+  --input-dir dataset/input \
+  --target-dir dataset/target \
+  --target-icc profiles/PSOcoated_v3.icc \
+  --model models/adaptive_global.pt \
   --val-ratio 0.1 \
   --epochs 6
 ```
 
-`--region skin` 只在皮肤上混合人像 LUT。`test.py` / `server.py` 直接加载 `.pt`：
+`test.py` / `server.py` 直接加载 `.pt`：
 
 ```bash
 python3 test.py \
   --model models/adaptive_portrait.pt \
   --input in.jpg \
   --output result.tif
+
+python3 server.py \
+  --model models/adaptive_portrait.pt \
+  --data web_data \
+  --host 127.0.0.1 \
+  --port 8765
 ```
 
 `--edge-lift` 和 `--shadow-lift` 仍作用在最终 CMYK 上，默认与之前相同。旧的 `.npz` 残差 LUT 模型可以继续用。
 
-## 训练
+## 数据配对
+
+多项式、残差 LUT 和自适应 LUT 使用同一套图片对参数。下面示例用 `train.py`，把命令换成 `train_adaptive_lut.py` 或 `train_residual_lut.py` 即可（后两者还必须加 `--target-icc`）。
 
 ```bash
 python3 train.py \
@@ -361,15 +402,15 @@ python3 test.py --model models/residual_lut_human_portrait.npz \
 
 ```bash
 python3 test.py \
-  --model models/residual_lut_v1.npz \
+  --model models/adaptive_portrait.pt \
   --input "/path/to/test_input.jpg" \
   --output result.tif \
   --target "/path/to/test_target.jpg"
 ```
 
-建议用 TIFF 保存中间结果，避免 CMYK JPEG 的二次压缩误差；需要交付 JPEG 时把输出后缀改为 `.jpg`。
+旧残差 LUT 把 `--model` 换成 `.npz` 即可。建议用 TIFF 保存中间结果，避免 CMYK JPEG 的二次压缩误差；需要交付 JPEG 时把输出后缀改为 `.jpg`。
 
-`test.py` 和 `server.py` 会自动识别旧多项式 `.npz` 与新残差 LUT `.npz`，不需要额外指定模型类型。残差 LUT 自带覆盖置信度和 ICC 回退，因此服务端的 `--max-hue-shift` 只作用于旧多项式模型。
+`test.py` 和 `server.py` 按扩展名识别 `.pt` 自适应模型、残差 LUT `.npz` 与旧多项式 `.npz`。残差 LUT 自带覆盖置信度和 ICC 回退，因此服务端的 `--max-hue-shift` 只作用于旧多项式模型。
 
 ## 批量处理与审核系统
 
@@ -388,11 +429,10 @@ python3 test.py \
 
 ```bash
 python3 server.py \
-  --model 5D2A8056_model.npz \
+  --model models/adaptive_portrait.pt \
   --data web_data \
   --host 127.0.0.1 \
   --port 8765 \
-  --max-hue-shift 15 \
   --max-upload-mb 512
 ```
 
