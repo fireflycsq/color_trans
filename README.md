@@ -274,6 +274,15 @@ python3 test.py --model models/residual_lut_human_portrait.npz \
 
 `--edge-lift 0` 可关掉。审核服务同样支持 `--edge-lift`。没有人像 LUT 时，只要装了 mediapipe，全局模型也会用整身轮廓做这一圈提亮。
 
+人像阴影、舞台这类暗场，深色衣服和背景不在轮廓上，`edge-lift` 帮不上。推理会再按原图暗部减墨（默认峰值 K `0.06`、C/M/Y 各 `0.035`）：亮度很低的衣服和幕布一起提亮，脸和聚光处几乎不动。不需要重训。黑场发灰就减小，衣服和背景仍闷就加大：
+
+```bash
+python3 test.py --model models/residual_lut_human_portrait.npz \
+  --input in.jpg --output result.tif --shadow-lift 0.08
+```
+
+`--shadow-lift 0` 可关掉。审核服务同样支持 `--shadow-lift`。
+
 ## 推理与测试
 
 ```bash

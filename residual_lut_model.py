@@ -19,6 +19,10 @@ from portrait_mask import (
 
 DEFAULT_EDGE_LIFT = 0.05
 DEFAULT_EDGE_LIFT_C = 0.02
+DEFAULT_SHADOW_LIFT = 0.06
+DEFAULT_SHADOW_LIFT_CMY = 0.035
+SHADOW_LUMA_FULL = 0.08
+SHADOW_LUMA_FADE = 0.42
 
 
 def trilinear_lookup(table: np.ndarray, rgb: np.ndarray) -> np.ndarray:
@@ -65,6 +69,37 @@ def edge_lift_amounts(
     return max(0.0, k_lift), max(0.0, c_lift)
 
 
+def shadow_weight(
+    rgb: np.ndarray,
+    full: float = SHADOW_LUMA_FULL,
+    fade: float = SHADOW_LUMA_FADE,
+) -> np.ndarray:
+    """1 in deep shadows, 0 by midtones, based on source sRGB luma."""
+    rgb = np.asarray(rgb, dtype=np.float32)
+    luma = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    span = max(fade - full, 1e-6)
+    t = np.clip((luma - full) / span, 0.0, 1.0)
+    smooth = t * t * (3.0 - 2.0 * t)
+    return (1.0 - smooth).astype(np.float32)
+
+
+def shadow_lift_amounts(
+    metadata: dict | None, override: float | None = None,
+) -> tuple[float, float]:
+    """K and C/M/Y reductions in deep shadows, in CMYK units of 0..1."""
+    meta = metadata or {}
+    if override is not None:
+        k_lift = float(override)
+        scale = k_lift / DEFAULT_SHADOW_LIFT if DEFAULT_SHADOW_LIFT else 0.0
+        cmy_lift = DEFAULT_SHADOW_LIFT_CMY * scale
+    else:
+        k_lift = float(meta.get("shadow_lift", DEFAULT_SHADOW_LIFT))
+        cmy_lift = float(meta.get(
+            "shadow_lift_cmy", DEFAULT_SHADOW_LIFT_CMY if k_lift > 0 else 0.0,
+        ))
+    return max(0.0, k_lift), max(0.0, cmy_lift)
+
+
 def _validate_lut(lut: np.ndarray, confidence: np.ndarray, name: str) -> None:
     size = int(lut.shape[0])
     if lut.shape != (size, size, size, 4):
@@ -99,6 +134,7 @@ class ResidualLUTModel:
         min_saturation: float = 0.16,
         chunk_rows: int = 128,
         edge_lift: float | None = None,
+        shadow_lift: float | None = None,
     ) -> Image.Image:
         """Apply ICC baseline and confidence-weighted residual corrections.
 
@@ -107,6 +143,8 @@ class ResidualLUTModel:
         confidence fallback and residual clipping learned at training time.
         ``edge_lift`` is extra K (and a little C) removed on the person
         silhouette; ``None`` uses the model metadata, default 0.05.
+        ``shadow_lift`` reduces ink in dark source pixels so clothes and
+        backdrops open up; ``None`` uses metadata, default 0.06.
         """
         del max_hue_shift, min_saturation
         source = image_to_srgb(image)
@@ -121,6 +159,7 @@ class ResidualLUTModel:
         strength = float(self.metadata.get("residual_strength", 1.0))
         portrait_strength = float(self.metadata.get("skin_residual_strength", 1.0))
         k_lift, c_lift = edge_lift_amounts(self.metadata, edge_lift)
+        shadow_k, shadow_cmy = shadow_lift_amounts(self.metadata, shadow_lift)
         portrait = None
         rgb_u8_full = np.asarray(source, dtype=np.uint8)
         if self.skin_lut is not None:
@@ -150,6 +189,12 @@ class ResidualLUTModel:
                         predicted[..., 0] -= edge * c_lift
                     if k_lift > 0:
                         predicted[..., 3] -= edge * k_lift
+            if shadow_k > 0 or shadow_cmy > 0:
+                dark = shadow_weight(rgb)
+                if shadow_cmy > 0:
+                    predicted[..., :3] -= dark[..., None] * shadow_cmy
+                if shadow_k > 0:
+                    predicted[..., 3] -= dark * shadow_k
             output[y:y + rgb.shape[0]] = np.rint(np.clip(predicted, 0, 1) * 255).astype(np.uint8)
         return Image.fromarray(output, "CMYK")
 

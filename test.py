@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image
 
 from color_model import image_to_srgb, load_color_model, render_cmyk_to_srgb, srgb_to_lab
-from residual_lut_model import ResidualLUTModel, edge_lift_amounts
+from residual_lut_model import ResidualLUTModel, edge_lift_amounts, shadow_lift_amounts
 from portrait_mask import portrait_mask, portrait_region_from_metadata
 
 
@@ -48,13 +48,19 @@ def main() -> None:
         "--edge-lift", type=float, default=None,
         help="silhouette K lift 0..1; default 0.05. Use 0 to disable",
     )
+    p.add_argument(
+        "--shadow-lift", type=float, default=None,
+        help="dark-tone K lift 0..1 for clothes and background; default 0.06. Use 0 to disable",
+    )
     args = p.parse_args()
     if args.edge_lift is not None and args.edge_lift < 0:
         raise ValueError("--edge-lift 不能为负数")
+    if args.shadow_lift is not None and args.shadow_lift < 0:
+        raise ValueError("--shadow-lift 不能为负数")
 
     model = load_color_model(args.model)
     src = Image.open(args.input)
-    pred = model.predict_image(src, edge_lift=args.edge_lift)
+    pred = model.predict_image(src, edge_lift=args.edge_lift, shadow_lift=args.shadow_lift)
     out = Path(args.output)
     save_args = {"icc_profile": model.target_icc}
     if out.suffix.lower() in {".jpg", ".jpeg"}:
@@ -67,6 +73,9 @@ def main() -> None:
         k_lift, c_lift = edge_lift_amounts(model.metadata, args.edge_lift)
         if k_lift > 0 or c_lift > 0:
             extras.append(f"edge-lift K={k_lift:g} C={c_lift:g}")
+        shadow_k, shadow_cmy = shadow_lift_amounts(model.metadata, args.shadow_lift)
+        if shadow_k > 0 or shadow_cmy > 0:
+            extras.append(f"shadow-lift K={shadow_k:g} CMY={shadow_cmy:g}")
     extra = f", {', '.join(extras)}" if extras else ""
     print(f"saved: {out.resolve()} ({pred.mode}, embedded {model.metadata['target_profile']}{extra})")
     if args.save_portrait_mask:

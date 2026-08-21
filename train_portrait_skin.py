@@ -367,6 +367,8 @@ def main() -> None:
         "skin_residual_strength": 1.0,
         "edge_lift": 0.05,
         "edge_lift_c": 0.02,
+        "shadow_lift": 0.06,
+        "shadow_lift_cmy": 0.035,
         "portrait_lut_nodes_with_samples": int(np.count_nonzero(weights)),
         "portrait_mean_node_confidence": float(skin_confidence.mean()),
         "portrait_train_metrics": train_metrics,

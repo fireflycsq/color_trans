@@ -356,6 +356,8 @@ def main() -> None:
         "fit_human": args.fit_human,
         "residual_stats_unclipped": residual_stats,
         "residual_strength": 1.0,
+        "shadow_lift": 0.06,
+        "shadow_lift_cmy": 0.035,
         "lut_nodes_with_samples": int(np.count_nonzero(weights)),
         "lut_nodes_total": int(weights.size),
         "mean_node_confidence": float(confidence.mean()),
