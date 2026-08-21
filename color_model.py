@@ -106,6 +106,7 @@ class ColorModel:
         max_hue_shift: float | None = None,
         min_saturation: float = 0.16,
         chunk_rows: int = 128,
+        edge_lift: float | None = None,
     ) -> Image.Image:
         """Predict CMYK, optionally protecting hues with an ICC conversion baseline.
 
@@ -113,6 +114,7 @@ class ColorModel:
         the target-profile ICC baseline are progressively blended back toward
         that baseline. Full fallback is reached at twice the configured shift.
         """
+        del edge_lift
         source = image_to_srgb(image)
         if max_hue_shift is None or max_hue_shift <= 0:
             return Image.fromarray(self.predict_array(np.asarray(source), chunk_rows), "CMYK")

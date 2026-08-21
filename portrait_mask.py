@@ -221,6 +221,12 @@ def person_probability(rgb_u8: np.ndarray) -> np.ndarray:
     return mask
 
 
+def portrait_edge_weight(mask: np.ndarray) -> np.ndarray:
+    """Soft silhouette ring in [0, 1], peaking where the mask is 0.5."""
+    mask = np.clip(np.asarray(mask, dtype=np.float32), 0.0, 1.0)
+    return (4.0 * mask * (1.0 - mask)).astype(np.float32)
+
+
 def _blur_mask(mask: np.ndarray, blur_radius: float) -> np.ndarray:
     if blur_radius <= 0:
         return mask

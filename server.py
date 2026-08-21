@@ -45,12 +45,14 @@ class AppState:
     def __init__(
         self, model_path: Path, data_dir: Path, workers: int = 2,
         max_hue_shift: float = 15.0, max_upload_mb: int = 512,
+        edge_lift: float | None = None,
     ):
         self.model = load_color_model(model_path)
         self.model_path = model_path
         self.data_dir = data_dir
         self.max_hue_shift = max_hue_shift
         self.max_upload_mb = max_upload_mb
+        self.edge_lift = edge_lift
         self.max_upload_bytes = max_upload_mb * 1024 * 1024
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -180,7 +182,9 @@ class AppState:
         root = self.batch_dir(batch_id)
         try:
             with Image.open(root / "input" / item["input_file"]) as source:
-                result = self.model.predict_image(source, max_hue_shift=self.max_hue_shift)
+                result = self.model.predict_image(
+                    source, max_hue_shift=self.max_hue_shift, edge_lift=self.edge_lift,
+                )
             output_name = image_id + ".tif"
             preview_name = image_id + ".jpg"
             result.save(root / "output" / output_name, compression="tiff_lzw", icc_profile=self.model.target_icc)
@@ -485,17 +489,25 @@ def main() -> None:
         "--max-upload-mb", type=int, default=512,
         help="maximum size of one input or target image in MB",
     )
+    p.add_argument(
+        "--edge-lift", type=float, default=None,
+        help="silhouette K lift 0..1; default 0.05 from the residual-LUT model. 0 disables",
+    )
     args = p.parse_args()
     if args.max_upload_mb <= 0:
         raise ValueError("--max-upload-mb must be greater than zero")
+    if args.edge_lift is not None and args.edge_lift < 0:
+        raise ValueError("--edge-lift 不能为负数")
     app = AppState(
         Path(args.model), Path(args.data), args.workers,
-        args.max_hue_shift, args.max_upload_mb,
+        args.max_hue_shift, args.max_upload_mb, args.edge_lift,
     )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.app = app  # type: ignore[attr-defined]
     print(f"Color Review running at http://{args.host}:{args.port}")
     print(f"Model: {Path(args.model).resolve()}")
+    if args.edge_lift is not None:
+        print(f"Edge lift: {args.edge_lift:g}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

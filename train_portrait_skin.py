@@ -365,6 +365,8 @@ def main() -> None:
         "portrait_embedded_target_icc_status": status,
         "portrait_created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "skin_residual_strength": 1.0,
+        "edge_lift": 0.05,
+        "edge_lift_c": 0.02,
         "portrait_lut_nodes_with_samples": int(np.count_nonzero(weights)),
         "portrait_mean_node_confidence": float(skin_confidence.mean()),
         "portrait_train_metrics": train_metrics,

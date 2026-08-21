@@ -265,6 +265,15 @@ python3 visualize_portrait_mask.py \
 
 `test.py` / `server.py` 会自动启用写入 `.npz` 的人像阶段。训练和推理必须都能做人像分割。
 
+推理时还会沿人像轮廓减一点 K（以及少量 C），用来提亮发丝和衣缘上发闷的混合像素。默认峰值约 K `0.05`、C `0.02`，不需要重训；已有人像模型也会生效。轮廓发白就减小，仍发暗就加大：
+
+```bash
+python3 test.py --model models/residual_lut_human_portrait.npz \
+  --input in.jpg --output result.tif --edge-lift 0.08
+```
+
+`--edge-lift 0` 可关掉。审核服务同样支持 `--edge-lift`。没有人像 LUT 时，只要装了 mediapipe，全局模型也会用整身轮廓做这一圈提亮。
+
 ## 推理与测试
 
 ```bash
