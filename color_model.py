@@ -45,17 +45,32 @@ def profile_from_bytes(data: bytes) -> ImageCms.ImageCmsProfile:
     return ImageCms.ImageCmsProfile(io.BytesIO(data))
 
 
-def image_to_srgb(image: Image.Image) -> Image.Image:
-    """Normalise an RGB-like image through its embedded ICC when available."""
+def apply_embedded_srgb(image: Image.Image, icc: bytes | None = None) -> Image.Image:
+    """Convert an RGB-like image, or a 1×N sample strip, through an embedded ICC."""
     rgb = image.convert("RGB")
-    icc = image.info.get("icc_profile")
-    if not icc:
+    profile = icc if icc is not None else image.info.get("icc_profile")
+    if not profile:
         return rgb
     try:
-        source = profile_from_bytes(icc)
-        return ImageCms.profileToProfile(rgb, source, ImageCms.createProfile("sRGB"), outputMode="RGB")
+        return ImageCms.profileToProfile(
+            rgb, profile_from_bytes(profile), ImageCms.createProfile("sRGB"), outputMode="RGB",
+        )
     except Exception:
         return rgb
+
+
+def samples_to_srgb(rgb_u8: np.ndarray, icc: bytes | None) -> np.ndarray:
+    """Convert (N, 3) source-encoded pixels to sRGB. No-op if there is no ICC."""
+    values = np.asarray(rgb_u8, dtype=np.uint8)
+    if not icc or values.size == 0:
+        return values
+    strip = Image.fromarray(values[None, ...], "RGB")
+    return np.asarray(apply_embedded_srgb(strip, icc), dtype=np.uint8)[0]
+
+
+def image_to_srgb(image: Image.Image) -> Image.Image:
+    """Normalise an RGB-like image through its embedded ICC when available."""
+    return apply_embedded_srgb(image)
 
 
 def render_cmyk_to_srgb(image: Image.Image, icc: bytes) -> Image.Image:

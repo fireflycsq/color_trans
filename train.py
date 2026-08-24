@@ -345,8 +345,12 @@ def accumulate_training(
     return a, b, total, coverage
 
 
-def render_samples(cmyk: np.ndarray, icc: bytes) -> np.ndarray:
-    image = Image.fromarray(np.rint(np.clip(cmyk, 0, 1) * 255).astype(np.uint8)[None, ...], "CMYK")
+def render_samples(cmyk: np.ndarray, icc: bytes, chunk: int = 4096) -> np.ndarray:
+    values = np.asarray(cmyk, dtype=np.float32).reshape(-1, 4)
+    if len(values) > chunk:
+        parts = [render_samples(values[i:i + chunk], icc, chunk) for i in range(0, len(values), chunk)]
+        return np.concatenate(parts, axis=0)
+    image = Image.fromarray(np.rint(np.clip(values, 0, 1) * 255).astype(np.uint8)[None, ...], "CMYK")
     return np.asarray(render_cmyk_to_srgb(image, icc), dtype=np.float32)[0] / 255.0
 
 

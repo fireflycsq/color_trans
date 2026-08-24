@@ -47,6 +47,40 @@ def _torch():
     return torch, nn, F
 
 
+def resolve_device(name: str | None = None):
+    torch, _, _ = _torch()
+    if name:
+        device = torch.device(name)
+        if device.type == "mps" and not torch.backends.mps.is_available():
+            raise ValueError(
+                "MPS 不可用。需要本机 macOS + Apple Silicon 的 PyTorch；"
+                "Linux / Docker 请用 --device cpu 或 --device cuda"
+            )
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise ValueError("CUDA 不可用，请改用 --device cpu")
+        return device
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def numpy_to_torch(array, device, dtype=None):
+    """Copy a NumPy array onto device. Avoids MPS sharing storage with NumPy."""
+    torch, _, _ = _torch()
+    arr = np.ascontiguousarray(array)
+    if dtype is not None:
+        arr = np.asarray(arr, dtype=dtype)
+    try:
+        tensor = torch.from_numpy(arr.copy())
+    except RuntimeError:
+        tensor = torch.tensor(arr)
+    return tensor.to(device)
+
+
+def tensor_to_numpy(tensor) -> np.ndarray:
+    return tensor.detach().contiguous().cpu().numpy()
+
+
 def resize_square(rgb_u8: np.ndarray, size: int = THUMBNAIL) -> Image.Image:
     return Image.fromarray(np.asarray(rgb_u8, dtype=np.uint8), "RGB").resize(
         (size, size), Image.Resampling.BILINEAR,
@@ -54,10 +88,8 @@ def resize_square(rgb_u8: np.ndarray, size: int = THUMBNAIL) -> Image.Image:
 
 
 def image_to_tensor(image: Image.Image, device):
-    torch, _, _ = _torch()
     rgb = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(0)
-    return tensor.to(device)
+    return numpy_to_torch(rgb, device).permute(2, 0, 1).unsqueeze(0).contiguous()
 
 
 class SmallLutEncoder:
@@ -100,15 +132,22 @@ class SmallLutEncoder:
 
 
 def torch_trilinear(table, rgb):
-    """table (n,n,n[,C]), rgb (N,3) in [0,1] → (N[,C])."""
-    torch, _, _ = _torch()
-    size = table.shape[0]
-    position = rgb.clamp(0, 1) * (size - 1)
+    """table (n,n,n[,C]), rgb (N,3) in [0,1] → (N[,C]).
+
+    Uses index_select instead of advanced indexing so MPS does not fall back
+    through NumPy (which raises "Numpy is not available" on some builds).
+    """
+    squeeze = table.dim() == 3
+    if squeeze:
+        table = table.unsqueeze(-1)
+    n = table.shape[0]
+    channels = table.shape[-1]
+    position = rgb.clamp(0, 1) * (n - 1)
     lower = position.floor().long()
-    upper = (lower + 1).clamp(max=size - 1)
+    upper = (lower + 1).clamp(max=n - 1)
     frac = position - lower.float()
-    extra = table.shape[3:]
-    result = rgb.new_zeros((rgb.shape[0],) + extra)
+    flat = table.reshape(n * n * n, channels)
+    result = rgb.new_zeros(rgb.shape[0], channels)
     for dr in (0, 1):
         ir = upper[:, 0] if dr else lower[:, 0]
         wr = frac[:, 0] if dr else 1 - frac[:, 0]
@@ -118,12 +157,10 @@ def torch_trilinear(table, rgb):
             for db in (0, 1):
                 ib = upper[:, 2] if db else lower[:, 2]
                 wb = frac[:, 2] if db else 1 - frac[:, 2]
-                weight = wr * wg * wb
-                values = table[ir, ig, ib]
-                if extra:
-                    weight = weight.unsqueeze(-1)
-                result = result + values * weight
-    return result
+                idx = ir * (n * n) + ig * n + ib
+                values = flat.index_select(0, idx)
+                result = result + values * (wr * wg * wb).unsqueeze(-1)
+    return result.squeeze(-1) if squeeze else result
 
 
 def apply_lut_torch(rgb, baseline, lut, confidence):
@@ -134,8 +171,24 @@ def apply_lut_torch(rgb, baseline, lut, confidence):
 
 
 def apply_lut_numpy(
-    rgb: np.ndarray, baseline: np.ndarray, lut: np.ndarray, confidence: np.ndarray,
+    rgb: np.ndarray,
+    baseline: np.ndarray,
+    lut: np.ndarray,
+    confidence: np.ndarray,
+    chunk_rows: int = 128,
 ) -> np.ndarray:
+    if rgb.ndim == 3 and rgb.shape[0] > chunk_rows > 0:
+        parts = [
+            apply_lut_numpy(
+                rgb[y:y + chunk_rows],
+                baseline[y:y + chunk_rows],
+                lut,
+                confidence,
+                chunk_rows=0,
+            )
+            for y in range(0, rgb.shape[0], chunk_rows)
+        ]
+        return np.concatenate(parts, axis=0)
     residual = trilinear_lookup(lut, rgb)
     gate = trilinear_lookup(confidence, rgb)
     return np.clip(baseline + gate[..., None] * residual, 0.0, 1.0)
@@ -179,8 +232,8 @@ class AdaptiveLUTModel:
         with torch.no_grad():
             lut, confidence = encoder(image_to_tensor(image, self.device))
         return (
-            lut[0].detach().cpu().numpy().astype(np.float32),
-            confidence[0].detach().cpu().numpy().astype(np.float32),
+            lut[0].detach().contiguous().cpu().numpy().astype(np.float32),
+            confidence[0].detach().contiguous().cpu().numpy().astype(np.float32),
         )
 
     def icc_baseline(self, source: Image.Image) -> np.ndarray:
@@ -192,11 +245,21 @@ class AdaptiveLUTModel:
         )
         return np.asarray(ImageCms.applyTransform(source, transform), dtype=np.float32) / 255.0
 
-    def correct_cmyk(self, rgb_u8: np.ndarray, baseline: np.ndarray) -> np.ndarray:
-        thumb = resize_square(rgb_u8, int(self.metadata.get("thumbnail", THUMBNAIL)))
+    def correct_cmyk(
+        self,
+        rgb_u8: np.ndarray,
+        baseline: np.ndarray,
+        rgb: np.ndarray | None = None,
+        sample_idx: np.ndarray | None = None,
+        chunk_rows: int = 128,
+        thumb: Image.Image | None = None,
+    ) -> np.ndarray:
+        if thumb is None:
+            thumb = resize_square(rgb_u8, int(self.metadata.get("thumbnail", THUMBNAIL)))
         lut, confidence = self.encode_lut(self.global_encoder, thumb)
-        rgb = rgb_u8.astype(np.float32) / 255.0
-        corrected = apply_lut_numpy(rgb, baseline, lut, confidence)
+        if rgb is None:
+            rgb = rgb_u8.astype(np.float32) / 255.0
+        corrected = apply_lut_numpy(rgb, baseline, lut, confidence, chunk_rows)
         if self.portrait_encoder is None:
             return corrected
         region = self.portrait_region
@@ -207,8 +270,8 @@ class AdaptiveLUTModel:
         if crop is None:
             return corrected
         p_lut, p_conf = self.encode_lut(self.portrait_encoder, crop)
-        portrait = apply_lut_numpy(rgb, corrected, p_lut, p_conf)
-        weight = mask[..., None]
+        portrait = apply_lut_numpy(rgb, corrected, p_lut, p_conf, chunk_rows)
+        weight = mask.reshape(-1)[sample_idx][..., None] if sample_idx is not None else mask[..., None]
         return np.clip((1.0 - weight) * corrected + weight * portrait, 0.0, 1.0)
 
     def predict_image(
@@ -220,11 +283,11 @@ class AdaptiveLUTModel:
         edge_lift: float | None = None,
         shadow_lift: float | None = None,
     ) -> Image.Image:
-        del max_hue_shift, min_saturation, chunk_rows
+        del max_hue_shift, min_saturation
         source = image_to_srgb(image)
         rgb_u8 = np.asarray(source, dtype=np.uint8)
         baseline = self.icc_baseline(source)
-        cmyk = self.correct_cmyk(rgb_u8, baseline)
+        cmyk = self.correct_cmyk(rgb_u8, baseline, chunk_rows=chunk_rows)
         k_lift, c_lift = edge_lift_amounts(self.metadata, edge_lift)
         if k_lift > 0 or c_lift > 0:
             region = self.portrait_region if self.portrait_encoder is not None else "person"

@@ -24,9 +24,10 @@ from adaptive_lut_model import (
     apply_lut_torch,
     image_to_tensor,
     lut_smoothness,
-    resize_square,
+    numpy_to_torch,
+    resolve_device,
 )
-from color_model import image_to_srgb
+from color_model import apply_embedded_srgb, samples_to_srgb
 from portrait_mask import portrait_crop, portrait_mask, require_person_segmenter
 from train import (
     Pair,
@@ -50,12 +51,24 @@ def _torch():
     return torch, F
 
 
-def load_pair_arrays(pair: Pair) -> tuple[np.ndarray, np.ndarray]:
+def srgb_thumbnail(rgb: Image.Image, icc: bytes | None, size: int) -> Image.Image:
+    thumb = rgb.resize((size, size), Image.Resampling.BILINEAR)
+    return apply_embedded_srgb(thumb, icc)
+
+
+def load_pair_arrays(
+    pair: Pair, thumbnail: int = THUMBNAIL,
+) -> tuple[np.ndarray, np.ndarray, bytes | None, Image.Image]:
     with Image.open(pair.source) as source:
-        rgb_u8 = np.asarray(image_to_srgb(source), dtype=np.uint8)
+        src_icc = source.info.get("icc_profile")
+        rgb_img = source.convert("RGB")
+        thumb = srgb_thumbnail(rgb_img, src_icc, thumbnail)
+        rgb_u8 = np.asarray(rgb_img, dtype=np.uint8)
     with Image.open(pair.target) as target:
         target_u8 = np.asarray(target.convert("CMYK"), dtype=np.uint8)
-    return rgb_u8, target_u8
+    if rgb_u8.shape[:2] != target_u8.shape[:2]:
+        raise ValueError(f"尺寸不一致 {pair.name}: {rgb_u8.shape[1]}x{rgb_u8.shape[0]} vs {target_u8.shape[1]}x{target_u8.shape[0]}")
+    return rgb_u8, target_u8, src_icc, thumb
 
 
 def icc_samples(rgb_u8: np.ndarray, transform) -> np.ndarray:
@@ -64,18 +77,25 @@ def icc_samples(rgb_u8: np.ndarray, transform) -> np.ndarray:
 
 
 def sample_pixels(
-    rgb_u8: np.ndarray, target_u8: np.ndarray, count: int, seed: int, transform,
+    rgb_u8: np.ndarray,
+    target_u8: np.ndarray,
+    count: int,
+    seed: int,
+    transform,
+    src_icc: bytes | None = None,
 ):
     idx = stratified_indices(rgb_u8, min(count, rgb_u8.shape[0] * rgb_u8.shape[1]), seed)
-    rgb_s = rgb_u8.reshape(-1, 3)[idx]
+    rgb_s = samples_to_srgb(rgb_u8.reshape(-1, 3)[idx], src_icc)
     target = target_u8.reshape(-1, 4)[idx].astype(np.float32) / 255.0
     baseline = icc_samples(rgb_s, transform)
     rgb = rgb_s.astype(np.float32) / 255.0
     return rgb, baseline, target, idx
 
 
-def encode_full(encoder, rgb_u8: np.ndarray, device, size: int):
-    return encoder(image_to_tensor(resize_square(rgb_u8, size), device))
+def encode_full(encoder, image: Image.Image, device, size: int | None = None):
+    if size is not None and image.size != (size, size):
+        image = image.resize((size, size), Image.Resampling.BILINEAR)
+    return encoder(image_to_tensor(image, device))
 
 
 def train_epoch(
@@ -90,35 +110,42 @@ def train_epoch(
     steps = 0
     budget = sample_budget(len(pairs), args.samples_per_image, args.max_samples)
     for i, pair in enumerate(pairs, 1):
-        rgb_u8, target_u8 = load_pair_arrays(pair)
-        rgb, baseline, target, idx = sample_pixels(
-            rgb_u8, target_u8, budget, seed + i, transform,
+        with Image.open(pair.source) as preview:
+            width, height = preview.size
+        print(
+            f"[train {i:>4}/{len(pairs)}] {pair.name} {width}x{height}: loading",
+            flush=True,
         )
-        rgb_t = torch.from_numpy(rgb).to(device)
-        base_t = torch.from_numpy(baseline).to(device)
-        target_t = torch.from_numpy(target).to(device)
+        rgb_u8, target_u8, src_icc, thumb = load_pair_arrays(pair, args.thumbnail)
+        rgb, baseline, target, idx = sample_pixels(
+            rgb_u8, target_u8, budget, seed + i, transform, src_icc,
+        )
+        rgb_t = numpy_to_torch(rgb, device)
+        base_t = numpy_to_torch(baseline, device)
+        target_t = numpy_to_torch(target, device)
         if global_encoder is None:
-            lut, conf = encode_full(encoder, rgb_u8, device, args.thumbnail)
+            lut, conf = encode_full(encoder, thumb, device)
             pred = apply_lut_torch(rgb_t, base_t, lut[0], conf[0])
         else:
             mask_img = portrait_mask(rgb_u8, region=region)
             crop = portrait_crop(rgb_u8, mask_img, args.thumbnail, args.mask_threshold)
             mask = mask_img.reshape(-1)[idx]
             if crop is None or float(mask.max()) < args.mask_threshold:
-                print(f"[train {i:>4}/{len(pairs)}] {pair.name}: no {region} crop")
+                print(f"[train {i:>4}/{len(pairs)}] {pair.name}: no {region} crop", flush=True)
                 continue
+            crop = apply_embedded_srgb(crop, src_icc)
             with torch.no_grad():
-                g_lut, g_conf = encode_full(global_encoder, rgb_u8, device, args.thumbnail)
+                g_lut, g_conf = encode_full(global_encoder, thumb, device)
                 base = apply_lut_torch(rgb_t, base_t, g_lut[0], g_conf[0])
             lut, conf = encoder(image_to_tensor(crop, device))
             portrait = apply_lut_torch(rgb_t, base, lut[0], conf[0])
-            gate = torch.from_numpy(mask.astype(np.float32)).to(device).unsqueeze(-1)
+            gate = numpy_to_torch(mask.astype(np.float32), device).unsqueeze(-1)
             pred = (1.0 - gate) * base + gate * portrait
             keep = mask >= args.mask_threshold
             if int(np.count_nonzero(keep)) < 32:
-                print(f"[train {i:>4}/{len(pairs)}] {pair.name}: too few {region} pixels")
+                print(f"[train {i:>4}/{len(pairs)}] {pair.name}: too few {region} pixels", flush=True)
                 continue
-            keep_t = torch.from_numpy(keep).to(device)
+            keep_t = numpy_to_torch(keep, device)
             pred = pred[keep_t]
             target_t = target_t[keep_t]
         loss = F.huber_loss(pred, target_t, delta=args.huber_delta)
@@ -128,7 +155,10 @@ def train_epoch(
         optimizer.step()
         total += float(loss.item())
         steps += 1
-        print(f"[train {i:>4}/{len(pairs)}] {pair.name}: loss={loss.item():.5f} pixels={pred.shape[0]:,}")
+        print(
+            f"[train {i:>4}/{len(pairs)}] {pair.name}: loss={loss.item():.5f} pixels={pred.shape[0]:,}",
+            flush=True,
+        )
     if steps == 0:
         raise ValueError("这个 epoch 没有可用样本")
     return total / steps
@@ -144,22 +174,29 @@ def evaluate_pairs(
     budget = sample_budget(len(pairs), per_image, maximum)
     baselines, preds, targets = [], [], []
     for i, pair in enumerate(pairs, 1):
-        rgb_u8, target_u8 = load_pair_arrays(pair)
-        rgb, baseline, target, idx = sample_pixels(
-            rgb_u8, target_u8, budget, seed + i, transform,
+        with Image.open(pair.source) as preview:
+            width, height = preview.size
+        print(
+            f"[{label} {i:>4}/{len(pairs)}] {pair.name} {width}x{height}: "
+            f"loading / sampling {budget} pixels",
+            flush=True,
         )
-        source = Image.fromarray(rgb_u8, "RGB")
-        full = model.correct_cmyk(rgb_u8, model.icc_baseline(source)).reshape(-1, 4)[idx]
+        rgb_u8, target_u8, src_icc, thumb = load_pair_arrays(pair, int(model.metadata.get("thumbnail", THUMBNAIL)))
+        rgb, baseline, target, idx = sample_pixels(
+            rgb_u8, target_u8, budget, seed + i, transform, src_icc,
+        )
+        pred = model.correct_cmyk(rgb_u8, baseline, rgb=rgb, sample_idx=idx, thumb=thumb)
         pair_icc = metric_summary(baseline, target, icc)
-        pair_model = metric_summary(full, target, icc)
+        pair_model = metric_summary(pred, target, icc)
         print(
             f"[{label} {i:>4}/{len(pairs)}] {pair.name}: "
             f"ICC ΔE={pair_icc['delta_e76']['mean']:.3f} "
             f"model ΔE={pair_model['delta_e76']['mean']:.3f} "
-            f"CMYK MAE={np.round(pair_model['cmyk_mae'], 1).tolist()}"
+            f"CMYK MAE={np.round(pair_model['cmyk_mae'], 1).tolist()}",
+            flush=True,
         )
         baselines.append(baseline)
-        preds.append(full)
+        preds.append(pred)
         targets.append(target)
     pred = np.concatenate(preds)
     target = np.concatenate(targets)
@@ -223,7 +260,7 @@ def main() -> None:
         raise ValueError("--grid-size 必须至少为 2")
     if args.epochs < 1:
         raise ValueError("--epochs 必须至少为 1")
-    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = resolve_device(args.device)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
