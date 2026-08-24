@@ -47,8 +47,9 @@ class AppState:
         max_hue_shift: float = 15.0, max_upload_mb: int = 512,
         edge_lift: float | None = None,
         shadow_lift: float | None = None,
+        device: str | None = "cpu",
     ):
-        self.model = load_color_model(model_path)
+        self.model = load_color_model(model_path, device=device)
         self.model_path = model_path
         self.data_dir = data_dir
         self.max_hue_shift = max_hue_shift
@@ -58,6 +59,7 @@ class AppState:
         self.max_upload_bytes = max_upload_mb * 1024 * 1024
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.infer_lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="colour")
 
     def batch_dir(self, batch_id: str) -> Path:
@@ -184,12 +186,13 @@ class AppState:
         root = self.batch_dir(batch_id)
         try:
             with Image.open(root / "input" / item["input_file"]) as source:
-                result = self.model.predict_image(
-                    source,
-                    max_hue_shift=self.max_hue_shift,
-                    edge_lift=self.edge_lift,
-                    shadow_lift=self.shadow_lift,
-                )
+                with self.infer_lock:
+                    result = self.model.predict_image(
+                        source,
+                        max_hue_shift=self.max_hue_shift,
+                        edge_lift=self.edge_lift,
+                        shadow_lift=self.shadow_lift,
+                    )
             output_name = image_id + ".tif"
             preview_name = image_id + ".jpg"
             result.save(root / "output" / output_name, compression="tiff_lzw", icc_profile=self.model.target_icc)
@@ -502,6 +505,10 @@ def main() -> None:
         "--shadow-lift", type=float, default=None,
         help="dark-tone K lift 0..1 for clothes and background; default 0.06. 0 disables",
     )
+    p.add_argument(
+        "--device", default="cpu",
+        help="PyTorch device for .pt models. Web default is cpu",
+    )
     args = p.parse_args()
     if args.max_upload_mb <= 0:
         raise ValueError("--max-upload-mb must be greater than zero")
@@ -512,11 +519,13 @@ def main() -> None:
     app = AppState(
         Path(args.model), Path(args.data), args.workers,
         args.max_hue_shift, args.max_upload_mb, args.edge_lift, args.shadow_lift,
+        device=args.device,
     )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.app = app  # type: ignore[attr-defined]
     print(f"Color Review running at http://{args.host}:{args.port}")
     print(f"Model: {Path(args.model).resolve()}")
+    print(f"Device: {args.device}")
     if args.edge_lift is not None:
         print(f"Edge lift: {args.edge_lift:g}")
     if args.shadow_lift is not None:

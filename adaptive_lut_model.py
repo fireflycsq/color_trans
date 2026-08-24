@@ -97,7 +97,7 @@ def numpy_to_torch(array, device, dtype=None):
         tensor = torch.frombuffer(bytearray(arr.tobytes()), dtype=storage_dtype).clone()
         tensor = tensor.reshape(arr.shape)
     except (RuntimeError, TypeError, ValueError):
-        tensor = torch.tensor(arr.reshape(-1).tolist(), dtype=storage_dtype)
+        tensor = torch.tensor(arr.reshape(-1).tolist(), dtype=storage_dtype, device="cpu")
         tensor = tensor.reshape(arr.shape)
     if torch_dtype == torch.bool:
         tensor = tensor.bool()
@@ -105,7 +105,21 @@ def numpy_to_torch(array, device, dtype=None):
 
 
 def tensor_to_numpy(tensor) -> np.ndarray:
-    return tensor.detach().contiguous().cpu().numpy()
+    torch, _, _ = _torch()
+    cpu = tensor.detach().contiguous().to("cpu")
+    try:
+        return np.array(cpu.numpy(), copy=True)
+    except (RuntimeError, TypeError):
+        dtypes = {
+            torch.float32: np.float32,
+            torch.float64: np.float64,
+            torch.float16: np.float16,
+            torch.uint8: np.uint8,
+            torch.int32: np.int32,
+            torch.int64: np.int64,
+            torch.bool: np.bool_,
+        }
+        return np.array(cpu.tolist(), dtype=dtypes.get(cpu.dtype, np.float32))
 
 
 def resize_square(rgb_u8: np.ndarray, size: int = THUMBNAIL) -> Image.Image:
@@ -240,9 +254,7 @@ class AdaptiveLUTModel:
         device: str | None = None,
     ):
         torch, _, _ = _torch()
-        self.device = torch.device(
-            device or ("cuda" if torch.cuda.is_available() else "cpu")
-        )
+        self.device = resolve_device(None if device is None else str(device))
         self.global_encoder = global_encoder.to(self.device).eval()
         self.portrait_encoder = (
             None if portrait_encoder is None else portrait_encoder.to(self.device).eval()
@@ -259,8 +271,8 @@ class AdaptiveLUTModel:
         with torch.no_grad():
             lut, confidence = encoder(image_to_tensor(image, self.device))
         return (
-            lut[0].detach().contiguous().cpu().numpy().astype(np.float32),
-            confidence[0].detach().contiguous().cpu().numpy().astype(np.float32),
+            tensor_to_numpy(lut[0]).astype(np.float32),
+            tensor_to_numpy(confidence[0]).astype(np.float32),
         )
 
     def icc_baseline(self, source: Image.Image) -> np.ndarray:

@@ -185,12 +185,12 @@ class ColorModel:
             )
 
 
-def load_color_model(path: str | Path):
-    """Load a polynomial, residual-LUT, or adaptive RGB-LUT model."""
+def load_color_model(path: str | Path, device: str | None = None):
+    """Load a polynomial, residual-LUT, or adaptive CMYK-LUT model."""
     path = Path(path)
     if path.suffix.lower() in {".pt", ".pth"}:
         from adaptive_lut_model import AdaptiveLUTModel
-        return AdaptiveLUTModel.load(path)
+        return AdaptiveLUTModel.load(path, device=device)
     with np.load(path, allow_pickle=False) as z:
         is_lut = "lut" in z.files
     if is_lut:
