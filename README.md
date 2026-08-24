@@ -12,10 +12,10 @@ Input RGB
          ↓
     CMYK = ICC + 全局残差 + 遮罩 × 人像残差
          ↓
-    edge-lift / shadow-lift → Final CMYK
+    edge-lift → Final CMYK
 ```
 
-全图 CNN 看 256×256 缩略图，生成按 RGB 查表的 17³×4（ΔC/ΔM/ΔY/ΔK）残差和置信度。人像分支用 MediaPipe 抠人（或皮肤），裁切后再编码第二张残差 LUT，只在遮罩内叠到全局结果上。ICC 只做固定基线、不反传。训练损失直接对人工 CMYK target，因此可以学人工分色和 K 版。已有 `adaptive_rgb_lut_v1` 的 `.pt` 不能接着训，必须重训。
+全图 CNN 看 256×256 缩略图，生成按 RGB 查表的 17³×4（ΔC/ΔM/ΔY/ΔK）残差和置信度。人像分支用 MediaPipe 抠人（或皮肤），裁切后再编码第二张残差 LUT，只在遮罩内叠到全局结果上。ICC 只做固定基线、不反传。训练损失直接对人工 CMYK target，暗部和高光比中间调权重大（`--luma-weight`），以便拟合调图师的 S 曲线。已有 `adaptive_rgb_lut_v1` 的 `.pt` 不能接着训，必须重训。
 
 需要 PyTorch：
 
@@ -45,6 +45,7 @@ python3 train_adaptive_lut.py \
   --eval-samples-per-image 4096 \
   --max-eval-samples 250000 \
   --huber-delta 0.125 \
+  --luma-weight 1.0 \
   --lut-l1 0.01 \
   --smoothness 0.03 \
   --seed 42
@@ -94,7 +95,7 @@ python3 server.py \
   --port 8765
 ```
 
-`--edge-lift` 和 `--shadow-lift` 仍作用在最终 CMYK 上，默认与之前相同。旧的 `.npz` 残差 LUT 模型可以继续用。
+`--edge-lift` 仍作用在最终 CMYK 上（默认轮廓减 K）。新训的模型默认**关掉** `--shadow-lift`，以免把调图师压暗的阴影再提亮；需要暗部减墨时再显式传入，例如 `--shadow-lift 0.06`。旧的 `.npz` 若元数据里仍写着 0.06，行为不变。
 
 ## 数据配对
 
@@ -392,14 +393,14 @@ python3 test.py --model models/residual_lut_human_portrait.npz \
 
 `--edge-lift 0` 可关掉。审核服务同样支持 `--edge-lift`。没有人像 LUT 时，只要装了 mediapipe，全局模型也会用整身轮廓做这一圈提亮。
 
-人像阴影、舞台这类暗场，深色衣服和背景不在轮廓上，`edge-lift` 帮不上。推理会再按原图暗部减墨（默认峰值 K `0.06`、C/M/Y 各 `0.035`）：亮度很低的衣服和幕布一起提亮，脸和聚光处几乎不动。不需要重训。黑场发灰就减小，衣服和背景仍闷就加大：
+人像阴影、舞台这类暗场，深色衣服和背景不在轮廓上，`edge-lift` 帮不上。若要把暗部再减墨提亮，推理可按原图亮度减 K（峰值示例 K `0.06`、C/M/Y 各 `0.035`）。新模型默认关闭，以免抵消调图师的 S 曲线压暗：
 
 ```bash
 python3 test.py --model models/residual_lut_human_portrait.npz \
   --input in.jpg --output result.tif --shadow-lift 0.08
 ```
 
-`--shadow-lift 0` 可关掉。审核服务同样支持 `--shadow-lift`。
+审核服务同样支持 `--shadow-lift`。不需要时省略或设为 `0`。
 
 ## 推理与测试
 

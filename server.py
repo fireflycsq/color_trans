@@ -503,7 +503,7 @@ def main() -> None:
     )
     p.add_argument(
         "--shadow-lift", type=float, default=None,
-        help="dark-tone K lift 0..1 for clothes and background; default 0.06. 0 disables",
+        help="dark-tone K lift 0..1; default 0 (off). Use e.g. 0.06 to restore",
     )
     p.add_argument(
         "--device", default="cpu",

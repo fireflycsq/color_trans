@@ -51,7 +51,7 @@ def main() -> None:
     )
     p.add_argument(
         "--shadow-lift", type=float, default=None,
-        help="dark-tone K lift 0..1 for clothes and background; default 0.06. Use 0 to disable",
+        help="dark-tone K lift 0..1; default 0 (off). Use e.g. 0.06 to restore",
     )
     args = p.parse_args()
     if args.edge_lift is not None and args.edge_lift < 0:

@@ -19,8 +19,10 @@ from portrait_mask import (
 
 DEFAULT_EDGE_LIFT = 0.05
 DEFAULT_EDGE_LIFT_C = 0.02
-DEFAULT_SHADOW_LIFT = 0.06
-DEFAULT_SHADOW_LIFT_CMY = 0.035
+DEFAULT_SHADOW_LIFT = 0.0
+DEFAULT_SHADOW_LIFT_CMY = 0.0
+SHADOW_LIFT_K_REF = 0.06
+SHADOW_LIFT_CMY_REF = 0.035
 SHADOW_LUMA_FULL = 0.08
 SHADOW_LUMA_FADE = 0.42
 
@@ -90,8 +92,8 @@ def shadow_lift_amounts(
     meta = metadata or {}
     if override is not None:
         k_lift = float(override)
-        scale = k_lift / DEFAULT_SHADOW_LIFT if DEFAULT_SHADOW_LIFT else 0.0
-        cmy_lift = DEFAULT_SHADOW_LIFT_CMY * scale
+        scale = k_lift / SHADOW_LIFT_K_REF if SHADOW_LIFT_K_REF else 0.0
+        cmy_lift = SHADOW_LIFT_CMY_REF * scale
     else:
         k_lift = float(meta.get("shadow_lift", DEFAULT_SHADOW_LIFT))
         cmy_lift = float(meta.get(

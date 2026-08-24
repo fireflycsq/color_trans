@@ -98,6 +98,16 @@ def encode_full(encoder, image: Image.Image, device, size: int | None = None):
     return encoder(image_to_tensor(image, device))
 
 
+def luma_pixel_weight(rgb, strength: float):
+    """Heavier Huber weight at shadows and highlights (S-curve tones)."""
+    if strength <= 0:
+        return rgb.new_ones(rgb.shape[0])
+    luma = (
+        rgb[:, 0] * 0.299 + rgb[:, 1] * 0.587 + rgb[:, 2] * 0.114
+    ).clamp(0, 1)
+    return 1.0 + strength * (2.0 * (luma - 0.5).abs())
+
+
 def train_epoch(
     encoder, optimizer, pairs: list[Pair], transform, args, device, seed: int,
     global_encoder=None, region: str = "person",
@@ -123,6 +133,7 @@ def train_epoch(
         rgb_t = numpy_to_torch(rgb, device)
         base_t = numpy_to_torch(baseline, device)
         target_t = numpy_to_torch(target, device)
+        rgb_loss = rgb_t
         if global_encoder is None:
             lut, conf = encode_full(encoder, thumb, device)
             pred = apply_lut_torch(rgb_t, base_t, lut[0], conf[0])
@@ -148,7 +159,10 @@ def train_epoch(
             keep_t = numpy_to_torch(keep, device)
             pred = pred[keep_t]
             target_t = target_t[keep_t]
-        loss = F.huber_loss(pred, target_t, delta=args.huber_delta)
+            rgb_loss = rgb_t[keep_t]
+        huber = F.huber_loss(pred, target_t, delta=args.huber_delta, reduction="none")
+        weight = luma_pixel_weight(rgb_loss, args.luma_weight)
+        loss = (huber.mean(dim=-1) * weight).sum() / weight.sum().clamp_min(1e-6)
         loss = loss + args.lut_l1 * lut[0].abs().mean() + args.smoothness * lut_smoothness(lut[0])
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -243,6 +257,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-samples-per-image", type=int, default=4_096)
     p.add_argument("--max-eval-samples", type=int, default=250_000)
     p.add_argument("--huber-delta", type=float, default=0.125, help="Huber delta in CMYK 0..1 (~32/255)")
+    p.add_argument(
+        "--luma-weight", type=float, default=1.0,
+        help="extra Huber weight at shadows/highlights vs midtones; 0 disables",
+    )
     p.add_argument("--lut-l1", type=float, default=0.01)
     p.add_argument("--smoothness", type=float, default=0.03)
     p.add_argument("--mask-threshold", type=float, default=0.45)
@@ -260,6 +278,8 @@ def main() -> None:
         raise ValueError("--grid-size 必须至少为 2")
     if args.epochs < 1:
         raise ValueError("--epochs 必须至少为 1")
+    if args.luma_weight < 0:
+        raise ValueError("--luma-weight 不能为负数")
     device = resolve_device(args.device)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -297,7 +317,8 @@ def main() -> None:
     history = []
     print(
         f"objective: adaptive CMYK residual | stage={args.stage} | "
-        f"lut={args.grid_size}³×4 keyed by RGB | huber={args.huber_delta:g}"
+        f"lut={args.grid_size}³×4 keyed by RGB | huber={args.huber_delta:g} | "
+        f"luma-weight={args.luma_weight:g}"
     )
     for epoch in range(1, args.epochs + 1):
         print(f"epoch {epoch}/{args.epochs} stage={args.stage}")
@@ -326,6 +347,7 @@ def main() -> None:
         "epochs": args.epochs,
         "lr": args.lr,
         "huber_delta_cmyk": args.huber_delta,
+        "luma_weight": args.luma_weight,
         "lut_l1": args.lut_l1,
         "smoothness": args.smoothness,
         "portrait_region": region if args.stage == "portrait" else None,
@@ -338,8 +360,8 @@ def main() -> None:
         "embedded_target_icc_status": status,
         "edge_lift": 0.05,
         "edge_lift_c": 0.02,
-        "shadow_lift": 0.06,
-        "shadow_lift_cmy": 0.035,
+        "shadow_lift": 0.0,
+        "shadow_lift_cmy": 0.0,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "history": history,
     }
