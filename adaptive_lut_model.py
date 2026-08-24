@@ -64,16 +64,43 @@ def resolve_device(name: str | None = None):
     return torch.device("cpu")
 
 
+def _numpy_torch_dtype(arr, torch):
+    if arr.dtype == np.bool_ or arr.dtype == np.dtype(bool):
+        return torch.bool
+    if arr.dtype == np.uint8:
+        return torch.uint8
+    if arr.dtype == np.int32:
+        return torch.int32
+    if arr.dtype == np.int64:
+        return torch.int64
+    return torch.float32
+
+
 def numpy_to_torch(array, device, dtype=None):
-    """Copy a NumPy array onto device. Avoids MPS sharing storage with NumPy."""
+    """Copy a NumPy array onto device without asking PyTorch to infer numpy.float32.
+
+    Some NumPy 2 + MPS builds raise "Could not infer dtype of numpy.float32"
+    or "Numpy is not available" on from_numpy / torch.tensor(ndarray).
+    """
     torch, _, _ = _torch()
     arr = np.ascontiguousarray(array)
-    if dtype is not None:
-        arr = np.asarray(arr, dtype=dtype)
+    torch_dtype = dtype or _numpy_torch_dtype(arr, torch)
+    if torch_dtype == torch.bool:
+        arr = np.ascontiguousarray(arr, dtype=np.uint8)
+        storage_dtype = torch.uint8
+    elif torch_dtype == torch.float32:
+        arr = np.ascontiguousarray(arr, dtype=np.float32)
+        storage_dtype = torch.float32
+    else:
+        storage_dtype = torch_dtype
     try:
-        tensor = torch.from_numpy(arr.copy())
-    except RuntimeError:
-        tensor = torch.tensor(arr)
+        tensor = torch.frombuffer(bytearray(arr.tobytes()), dtype=storage_dtype).clone()
+        tensor = tensor.reshape(arr.shape)
+    except (RuntimeError, TypeError, ValueError):
+        tensor = torch.tensor(arr.reshape(-1).tolist(), dtype=storage_dtype)
+        tensor = tensor.reshape(arr.shape)
+    if torch_dtype == torch.bool:
+        tensor = tensor.bool()
     return tensor.to(device)
 
 
