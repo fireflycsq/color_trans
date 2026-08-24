@@ -1,18 +1,21 @@
 # RGB → 印刷 CMYK 调色模型
 
-这个项目从像素级对齐的 RGB 输入与 CMYK 目标图中学习印刷调色方向。推荐路径是 **场景自适应 RGB LUT → ICC → CMYK**，并由小 CNN 分别编码全图和人像裁切。原有三阶多项式、以及“固定 ICC + CMYK 残差 LUT”仍可加载。
+这个项目从像素级对齐的 RGB 输入与 CMYK 目标图中学习印刷调色方向。推荐路径是 **ICC 基线 + 场景自适应 CMYK 残差 LUT**，并由小 CNN 分别编码全图和人像裁切。原有三阶多项式、以及固定（非自适应）CMYK 残差 LUT 仍可加载。
 
-## 推荐：自适应 RGB LUT
+## 推荐：自适应 CMYK 残差 LUT
 
 ```text
 Input RGB
-    ├─ Global Encoder (Small CNN) → Global LUT + Confidence
-    └─ MediaPipe Person/Skin → Portrait Crop → Portrait Encoder → Portrait LUT
+    ├─ ICC ──────────────────────────────► CMYK 基线
+    ├─ Global Encoder (Small CNN) → 17³×4 残差 + Confidence
+    └─ MediaPipe Person/Skin → Crop → Portrait Encoder → 17³×4 残差
          ↓
-    Corrected RGB → ICC → CMYK → edge-lift / shadow-lift → Final CMYK
+    CMYK = ICC + 全局残差 + 遮罩 × 人像残差
+         ↓
+    edge-lift / shadow-lift → Final CMYK
 ```
 
-全图 CNN 看 256×256 缩略图，生成 17³ RGB 残差 LUT 和置信度，作用在整张图上。人像分支用 MediaPipe 抠人（或皮肤），把人像框缩放到 256×256 再编码一张 LUT，只在遮罩内与全局结果混合。ICC 不可微，所以训练损失是人工 CMYK 的软打样 RGB；推理仍先改 RGB，再转到印刷 CMYK。K 版由 ICC 的 GCR 决定，不会再学人工分色。
+全图 CNN 看 256×256 缩略图，生成按 RGB 查表的 17³×4（ΔC/ΔM/ΔY/ΔK）残差和置信度。人像分支用 MediaPipe 抠人（或皮肤），裁切后再编码第二张残差 LUT，只在遮罩内叠到全局结果上。ICC 只做固定基线、不反传。训练损失直接对人工 CMYK target，因此可以学人工分色和 K 版。已有 `adaptive_rgb_lut_v1` 的 `.pt` 不能接着训，必须重训。
 
 需要 PyTorch：
 
@@ -41,9 +44,9 @@ python3 train_adaptive_lut.py \
   --max-samples 1500000 \
   --eval-samples-per-image 4096 \
   --max-eval-samples 250000 \
-  --huber-delta 0.05 \
-  --lut-l1 0.02 \
-  --smoothness 0.05 \
+  --huber-delta 0.125 \
+  --lut-l1 0.01 \
+  --smoothness 0.03 \
   --seed 42
 
 python3 train_adaptive_lut.py \

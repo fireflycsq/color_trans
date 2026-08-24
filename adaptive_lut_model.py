@@ -1,9 +1,8 @@
-"""Image-adaptive RGB 3D LUTs, then a fixed ICC to CMYK.
+"""Image-adaptive CMYK residual 3D LUTs on a fixed ICC baseline.
 
-Global and portrait encoders are small CNNs. They emit a residual LUT and a
-confidence volume from a 256×256 thumbnail (full frame or person crop).
-Corrected RGB is converted with the embedded print ICC; edge-lift and
-shadow-lift still run on the CMYK result.
+Global and portrait encoders are small CNNs. They emit a 17³×4 residual LUT
+and a confidence volume from a 256×256 thumbnail. Lookup is keyed by RGB;
+the residual is added to ICC(sRGB). Loss is against the human CMYK target.
 """
 
 from __future__ import annotations
@@ -32,6 +31,8 @@ from residual_lut_model import (
 THUMBNAIL = 256
 DEFAULT_GRID = 17
 DEFAULT_CHANNELS = 32
+LUT_CHANNELS = 4
+MODEL_TYPE = "adaptive_cmyk_lut_v1"
 
 
 def _torch():
@@ -81,7 +82,7 @@ class SmallLutEncoder:
                 )
                 feat = c * 4
                 nodes = grid_size ** 3
-                self.lut_head = nn.Linear(feat, 3 * nodes)
+                self.lut_head = nn.Linear(feat, LUT_CHANNELS * nodes)
                 self.conf_head = nn.Linear(feat, nodes)
                 nn.init.zeros_(self.lut_head.weight)
                 nn.init.zeros_(self.lut_head.bias)
@@ -91,7 +92,7 @@ class SmallLutEncoder:
             def forward(self, image):
                 features = self.backbone(image).flatten(1)
                 n = self.grid_size
-                lut = self.lut_head(features).view(-1, n, n, n, 3)
+                lut = self.lut_head(features).view(-1, n, n, n, LUT_CHANNELS)
                 confidence = torch.sigmoid(self.conf_head(features)).view(-1, n, n, n)
                 return lut, confidence
 
@@ -125,16 +126,19 @@ def torch_trilinear(table, rgb):
     return result
 
 
-def apply_lut_torch(rgb, lut, confidence):
+def apply_lut_torch(rgb, baseline, lut, confidence):
+    """RGB-keyed residual added to an ICC CMYK baseline."""
     residual = torch_trilinear(lut, rgb)
     gate = torch_trilinear(confidence.unsqueeze(-1), rgb)
-    return (rgb + gate * residual).clamp(0, 1)
+    return (baseline + gate * residual).clamp(0, 1)
 
 
-def apply_lut_numpy(rgb: np.ndarray, lut: np.ndarray, confidence: np.ndarray) -> np.ndarray:
+def apply_lut_numpy(
+    rgb: np.ndarray, baseline: np.ndarray, lut: np.ndarray, confidence: np.ndarray,
+) -> np.ndarray:
     residual = trilinear_lookup(lut, rgb)
     gate = trilinear_lookup(confidence, rgb)
-    return np.clip(rgb + gate[..., None] * residual, 0.0, 1.0)
+    return np.clip(baseline + gate[..., None] * residual, 0.0, 1.0)
 
 
 def lut_smoothness(lut):
@@ -145,7 +149,7 @@ def lut_smoothness(lut):
 
 
 class AdaptiveLUTModel:
-    """CNN-conditioned RGB LUTs followed by ICC and optional CMYK lifts."""
+    """CNN-conditioned CMYK residual LUTs on a fixed ICC baseline."""
 
     def __init__(
         self,
@@ -179,11 +183,20 @@ class AdaptiveLUTModel:
             confidence[0].detach().cpu().numpy().astype(np.float32),
         )
 
-    def correct_rgb(self, rgb_u8: np.ndarray) -> np.ndarray:
+    def icc_baseline(self, source: Image.Image) -> np.ndarray:
+        transform = ImageCms.buildTransform(
+            ImageCms.createProfile("sRGB"),
+            profile_from_bytes(self.target_icc),
+            "RGB", "CMYK", renderingIntent=1,
+            flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
+        )
+        return np.asarray(ImageCms.applyTransform(source, transform), dtype=np.float32) / 255.0
+
+    def correct_cmyk(self, rgb_u8: np.ndarray, baseline: np.ndarray) -> np.ndarray:
         thumb = resize_square(rgb_u8, int(self.metadata.get("thumbnail", THUMBNAIL)))
         lut, confidence = self.encode_lut(self.global_encoder, thumb)
         rgb = rgb_u8.astype(np.float32) / 255.0
-        corrected = apply_lut_numpy(rgb, lut, confidence)
+        corrected = apply_lut_numpy(rgb, baseline, lut, confidence)
         if self.portrait_encoder is None:
             return corrected
         region = self.portrait_region
@@ -194,7 +207,7 @@ class AdaptiveLUTModel:
         if crop is None:
             return corrected
         p_lut, p_conf = self.encode_lut(self.portrait_encoder, crop)
-        portrait = apply_lut_numpy(corrected, p_lut, p_conf)
+        portrait = apply_lut_numpy(rgb, corrected, p_lut, p_conf)
         weight = mask[..., None]
         return np.clip((1.0 - weight) * corrected + weight * portrait, 0.0, 1.0)
 
@@ -210,18 +223,8 @@ class AdaptiveLUTModel:
         del max_hue_shift, min_saturation, chunk_rows
         source = image_to_srgb(image)
         rgb_u8 = np.asarray(source, dtype=np.uint8)
-        corrected = self.correct_rgb(rgb_u8)
-        corrected_u8 = np.rint(corrected * 255.0).astype(np.uint8)
-        transform = ImageCms.buildTransform(
-            ImageCms.createProfile("sRGB"),
-            profile_from_bytes(self.target_icc),
-            "RGB", "CMYK", renderingIntent=1,
-            flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
-        )
-        cmyk = np.asarray(
-            ImageCms.applyTransform(Image.fromarray(corrected_u8, "RGB"), transform),
-            dtype=np.float32,
-        ) / 255.0
+        baseline = self.icc_baseline(source)
+        cmyk = self.correct_cmyk(rgb_u8, baseline)
         k_lift, c_lift = edge_lift_amounts(self.metadata, edge_lift)
         if k_lift > 0 or c_lift > 0:
             region = self.portrait_region if self.portrait_encoder is not None else "person"
@@ -234,7 +237,7 @@ class AdaptiveLUTModel:
                     cmyk[..., 3] -= edge * k_lift
         shadow_k, shadow_cmy = shadow_lift_amounts(self.metadata, shadow_lift)
         if shadow_k > 0 or shadow_cmy > 0:
-            dark = shadow_weight(corrected)
+            dark = shadow_weight(rgb_u8.astype(np.float32) / 255.0)
             if shadow_cmy > 0:
                 cmyk[..., :3] -= dark[..., None] * shadow_cmy
             if shadow_k > 0:
@@ -245,9 +248,10 @@ class AdaptiveLUTModel:
     def save(self, path: str | Path) -> None:
         torch, _, _ = _torch()
         payload = {
-            "model_type": "adaptive_rgb_lut_v1",
+            "model_type": MODEL_TYPE,
             "grid_size": int(self.metadata.get("grid_size", DEFAULT_GRID)),
             "channels": int(self.metadata.get("encoder_channels", DEFAULT_CHANNELS)),
+            "lut_channels": LUT_CHANNELS,
             "thumbnail": int(self.metadata.get("thumbnail", THUMBNAIL)),
             "global_state": self.global_encoder.state_dict(),
             "portrait_state": None if self.portrait_encoder is None else self.portrait_encoder.state_dict(),
@@ -264,8 +268,13 @@ class AdaptiveLUTModel:
             payload = torch.load(path, map_location="cpu", weights_only=False)
         except TypeError:
             payload = torch.load(path, map_location="cpu")
-        if payload.get("model_type") != "adaptive_rgb_lut_v1":
-            raise ValueError(f"不是自适应 RGB LUT 模型：{path}")
+        model_type = payload.get("model_type")
+        if model_type == "adaptive_rgb_lut_v1":
+            raise ValueError(
+                f"{path} 是旧的自适应 RGB LUT，无法加载。请用 CMYK 残差路径重训"
+            )
+        if model_type != MODEL_TYPE:
+            raise ValueError(f"不是自适应 CMYK LUT 模型：{path}")
         metadata = json.loads(payload["metadata"])
         grid = int(payload.get("grid_size", metadata.get("grid_size", DEFAULT_GRID)))
         channels = int(payload.get("channels", metadata.get("encoder_channels", DEFAULT_CHANNELS)))

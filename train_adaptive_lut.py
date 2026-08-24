@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Train image-adaptive RGB LUTs, then print through a fixed ICC.
+"""Train image-adaptive CMYK residual LUTs on a fixed ICC baseline.
 
 Stage ``global`` trains a small CNN on the full frame. Stage ``portrait``
 freezes that encoder and trains a second CNN on a MediaPipe person/skin crop.
-Loss is on soft-proofed RGB because ICC is not differentiable; inference still
-does corrected RGB → ICC → CMYK, then edge-lift / shadow-lift.
+The CNN emits a 17³×4 residual; loss is Huber against the human CMYK target.
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ from adaptive_lut_model import (
     lut_smoothness,
     resize_square,
 )
-from color_model import image_to_srgb, render_cmyk_to_srgb, srgb_to_lab
+from color_model import image_to_srgb
 from portrait_mask import portrait_crop, portrait_mask, require_person_segmenter
 from train import (
     Pair,
@@ -39,7 +38,7 @@ from train import (
     stratified_indices,
     validate_pairs,
 )
-from train_residual_lut import build_to_cmyk
+from train_residual_lut import build_to_cmyk, metric_summary
 
 
 def _torch():
@@ -51,32 +50,28 @@ def _torch():
     return torch, F
 
 
-def load_pair_arrays(pair: Pair, icc: bytes) -> tuple[np.ndarray, np.ndarray]:
+def load_pair_arrays(pair: Pair) -> tuple[np.ndarray, np.ndarray]:
     with Image.open(pair.source) as source:
         rgb_u8 = np.asarray(image_to_srgb(source), dtype=np.uint8)
     with Image.open(pair.target) as target:
-        proof = np.asarray(render_cmyk_to_srgb(target.convert("CMYK"), icc), dtype=np.uint8)
-    return rgb_u8, proof
+        target_u8 = np.asarray(target.convert("CMYK"), dtype=np.uint8)
+    return rgb_u8, target_u8
 
 
-def sample_pixels(rgb_u8: np.ndarray, proof_u8: np.ndarray, count: int, seed: int):
+def icc_samples(rgb_u8: np.ndarray, transform) -> np.ndarray:
+    strip = Image.fromarray(np.asarray(rgb_u8, dtype=np.uint8)[None, ...], "RGB")
+    return np.asarray(ImageCms.applyTransform(strip, transform), dtype=np.float32)[0] / 255.0
+
+
+def sample_pixels(
+    rgb_u8: np.ndarray, target_u8: np.ndarray, count: int, seed: int, transform,
+):
     idx = stratified_indices(rgb_u8, min(count, rgb_u8.shape[0] * rgb_u8.shape[1]), seed)
-    rgb = rgb_u8.reshape(-1, 3)[idx].astype(np.float32) / 255.0
-    proof = proof_u8.reshape(-1, 3)[idx].astype(np.float32) / 255.0
-    return rgb, proof, idx
-
-
-def metric_rgb(pred: np.ndarray, target: np.ndarray) -> dict:
-    mae = np.mean(np.abs(pred - target), axis=0) * 255
-    de = np.linalg.norm(srgb_to_lab(pred) - srgb_to_lab(target), axis=-1)
-    return {
-        "rgb_mae": [float(x) for x in mae],
-        "delta_e76": {
-            "mean": float(de.mean()),
-            "p50": float(np.percentile(de, 50)),
-            "p95": float(np.percentile(de, 95)),
-        },
-    }
+    rgb_s = rgb_u8.reshape(-1, 3)[idx]
+    target = target_u8.reshape(-1, 4)[idx].astype(np.float32) / 255.0
+    baseline = icc_samples(rgb_s, transform)
+    rgb = rgb_s.astype(np.float32) / 255.0
+    return rgb, baseline, target, idx
 
 
 def encode_full(encoder, rgb_u8: np.ndarray, device, size: int):
@@ -84,7 +79,7 @@ def encode_full(encoder, rgb_u8: np.ndarray, device, size: int):
 
 
 def train_epoch(
-    encoder, optimizer, pairs: list[Pair], icc: bytes, args, device, seed: int,
+    encoder, optimizer, pairs: list[Pair], transform, args, device, seed: int,
     global_encoder=None, region: str = "person",
 ) -> float:
     torch, F = _torch()
@@ -95,13 +90,16 @@ def train_epoch(
     steps = 0
     budget = sample_budget(len(pairs), args.samples_per_image, args.max_samples)
     for i, pair in enumerate(pairs, 1):
-        rgb_u8, proof_u8 = load_pair_arrays(pair, icc)
-        rgb, proof, idx = sample_pixels(rgb_u8, proof_u8, budget, seed + i)
+        rgb_u8, target_u8 = load_pair_arrays(pair)
+        rgb, baseline, target, idx = sample_pixels(
+            rgb_u8, target_u8, budget, seed + i, transform,
+        )
         rgb_t = torch.from_numpy(rgb).to(device)
-        proof_t = torch.from_numpy(proof).to(device)
+        base_t = torch.from_numpy(baseline).to(device)
+        target_t = torch.from_numpy(target).to(device)
         if global_encoder is None:
             lut, conf = encode_full(encoder, rgb_u8, device, args.thumbnail)
-            pred = apply_lut_torch(rgb_t, lut[0], conf[0])
+            pred = apply_lut_torch(rgb_t, base_t, lut[0], conf[0])
         else:
             mask_img = portrait_mask(rgb_u8, region=region)
             crop = portrait_crop(rgb_u8, mask_img, args.thumbnail, args.mask_threshold)
@@ -111,9 +109,9 @@ def train_epoch(
                 continue
             with torch.no_grad():
                 g_lut, g_conf = encode_full(global_encoder, rgb_u8, device, args.thumbnail)
-                base = apply_lut_torch(rgb_t, g_lut[0], g_conf[0])
+                base = apply_lut_torch(rgb_t, base_t, g_lut[0], g_conf[0])
             lut, conf = encoder(image_to_tensor(crop, device))
-            portrait = apply_lut_torch(base, lut[0], conf[0])
+            portrait = apply_lut_torch(rgb_t, base, lut[0], conf[0])
             gate = torch.from_numpy(mask.astype(np.float32)).to(device).unsqueeze(-1)
             pred = (1.0 - gate) * base + gate * portrait
             keep = mask >= args.mask_threshold
@@ -122,8 +120,8 @@ def train_epoch(
                 continue
             keep_t = torch.from_numpy(keep).to(device)
             pred = pred[keep_t]
-            proof_t = proof_t[keep_t]
-        loss = F.huber_loss(pred, proof_t, delta=args.huber_delta)
+            target_t = target_t[keep_t]
+        loss = F.huber_loss(pred, target_t, delta=args.huber_delta)
         loss = loss + args.lut_l1 * lut[0].abs().mean() + args.smoothness * lut_smoothness(lut[0])
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -144,34 +142,40 @@ def evaluate_pairs(
         return None
     transform = build_to_cmyk(icc)
     budget = sample_budget(len(pairs), per_image, maximum)
-    preds, proofs, cmyk_preds, cmyk_targets = [], [], [], []
+    baselines, preds, targets = [], [], []
     for i, pair in enumerate(pairs, 1):
-        rgb_u8, proof_u8 = load_pair_arrays(pair, icc)
-        _, proof, idx = sample_pixels(rgb_u8, proof_u8, budget, seed + i)
-        corrected = model.correct_rgb(rgb_u8).reshape(-1, 3)[idx]
-        with Image.open(pair.target) as target:
-            target_cmyk = np.asarray(target.convert("CMYK"), dtype=np.float32).reshape(-1, 4)[idx] / 255.0
-        strip = Image.fromarray(
-            np.rint(np.clip(corrected, 0, 1) * 255).astype(np.uint8)[None, ...], "RGB",
+        rgb_u8, target_u8 = load_pair_arrays(pair)
+        rgb, baseline, target, idx = sample_pixels(
+            rgb_u8, target_u8, budget, seed + i, transform,
         )
-        pred_cmyk = np.asarray(ImageCms.applyTransform(strip, transform), dtype=np.float32)[0] / 255.0
-        rgb_m = metric_rgb(corrected, proof)
+        source = Image.fromarray(rgb_u8, "RGB")
+        full = model.correct_cmyk(rgb_u8, model.icc_baseline(source)).reshape(-1, 4)[idx]
+        pair_icc = metric_summary(baseline, target, icc)
+        pair_model = metric_summary(full, target, icc)
         print(
             f"[{label} {i:>4}/{len(pairs)}] {pair.name}: "
-            f"RGB MAE={np.mean(rgb_m['rgb_mae']):.2f} ΔE={rgb_m['delta_e76']['mean']:.3f}"
+            f"ICC ΔE={pair_icc['delta_e76']['mean']:.3f} "
+            f"model ΔE={pair_model['delta_e76']['mean']:.3f} "
+            f"CMYK MAE={np.round(pair_model['cmyk_mae'], 1).tolist()}"
         )
-        preds.append(corrected)
-        proofs.append(proof)
-        cmyk_preds.append(pred_cmyk)
-        cmyk_targets.append(target_cmyk)
+        baselines.append(baseline)
+        preds.append(full)
+        targets.append(target)
     pred = np.concatenate(preds)
-    proof = np.concatenate(proofs)
-    cmyk_err = np.mean(np.abs(np.concatenate(cmyk_preds) - np.concatenate(cmyk_targets)), axis=0) * 255
-    metrics = metric_rgb(pred, proof)
-    metrics["cmyk_mae"] = [float(x) for x in cmyk_err]
-    metrics["pairs"] = len(pairs)
-    metrics["samples"] = int(len(pred))
-    return metrics
+    target = np.concatenate(targets)
+    base = np.concatenate(baselines)
+    icc_metrics = metric_summary(base, target, icc)
+    model_metrics = metric_summary(pred, target, icc)
+    base_de, model_de = icc_metrics["delta_e76"]["mean"], model_metrics["delta_e76"]["mean"]
+    return {
+        "pairs": len(pairs),
+        "samples": int(len(pred)),
+        "icc_baseline": icc_metrics,
+        "icc_plus_lut": model_metrics,
+        "delta_e76_improvement_percent": float(100 * (base_de - model_de) / base_de) if base_de else 0.0,
+        "cmyk_mae": model_metrics["cmyk_mae"],
+        "delta_e76": model_metrics["delta_e76"],
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -201,9 +205,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-samples", type=int, default=1_500_000)
     p.add_argument("--eval-samples-per-image", type=int, default=4_096)
     p.add_argument("--max-eval-samples", type=int, default=250_000)
-    p.add_argument("--huber-delta", type=float, default=0.05, help="Huber delta in RGB 0..1")
-    p.add_argument("--lut-l1", type=float, default=0.02)
-    p.add_argument("--smoothness", type=float, default=0.05)
+    p.add_argument("--huber-delta", type=float, default=0.125, help="Huber delta in CMYK 0..1 (~32/255)")
+    p.add_argument("--lut-l1", type=float, default=0.01)
+    p.add_argument("--smoothness", type=float, default=0.03)
     p.add_argument("--mask-threshold", type=float, default=0.45)
     p.add_argument("--device", default=None)
     p.add_argument("--seed", type=int, default=42)
@@ -251,12 +255,17 @@ def main() -> None:
         icc = loaded.target_icc
         profile_name, profile_hash = profile_details(icc)
 
+    transform = build_to_cmyk(icc)
     optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
     history = []
+    print(
+        f"objective: adaptive CMYK residual | stage={args.stage} | "
+        f"lut={args.grid_size}³×4 keyed by RGB | huber={args.huber_delta:g}"
+    )
     for epoch in range(1, args.epochs + 1):
         print(f"epoch {epoch}/{args.epochs} stage={args.stage}")
         mean_loss = train_epoch(
-            encoder, optimizer, train_pairs, icc, args, device,
+            encoder, optimizer, train_pairs, transform, args, device,
             args.seed + epoch * 17, global_encoder, region,
         )
         print(f"epoch {epoch} mean loss={mean_loss:.5f}")
@@ -271,14 +280,15 @@ def main() -> None:
 
     metadata = {
         **(loaded.metadata if loaded is not None else {}),
-        "model_type": "adaptive_rgb_lut_v1",
+        "model_type": "adaptive_cmyk_lut_v1",
         "stage": args.stage,
         "grid_size": args.grid_size,
         "encoder_channels": args.channels,
+        "lut_channels": 4,
         "thumbnail": args.thumbnail,
         "epochs": args.epochs,
         "lr": args.lr,
-        "huber_delta_rgb": args.huber_delta,
+        "huber_delta_cmyk": args.huber_delta,
         "lut_l1": args.lut_l1,
         "smoothness": args.smoothness,
         "portrait_region": region if args.stage == "portrait" else None,
@@ -321,11 +331,12 @@ def main() -> None:
     print(f"saved model: {model_path.resolve()}")
     print(f"saved report: {report_path.resolve()}")
     if val_metrics:
-        print(
-            f"val RGB MAE mean={np.mean(val_metrics['rgb_mae']):.2f} "
-            f"ΔE={val_metrics['delta_e76']['mean']:.3f} "
-            f"CMYK MAE={val_metrics['cmyk_mae']}"
-        )
+        before = val_metrics["icc_baseline"]["delta_e76"]
+        after = val_metrics["icc_plus_lut"]["delta_e76"]
+        print(f"val ΔE76 ICC mean/p95: {before['mean']:.3f} / {before['p95']:.3f}")
+        print(f"val ΔE76 +LUT mean/p95: {after['mean']:.3f} / {after['p95']:.3f}")
+        print(f"val CMYK MAE [C M Y K]: {np.round(val_metrics['cmyk_mae'], 2).tolist()}")
+        print(f"val mean improvement: {val_metrics['delta_e76_improvement_percent']:.2f}%")
 
 
 if __name__ == "__main__":

@@ -69,7 +69,7 @@ def main() -> None:
     pred.save(out, **save_args)
     extras = []
     if isinstance(model, AdaptiveLUTModel):
-        extras.append("adaptive RGB LUT")
+        extras.append("adaptive CMYK LUT")
         if model.portrait_encoder is not None:
             extras.append(f"portrait-{model.portrait_region} on")
     if getattr(model, "skin_lut", None) is not None:
