@@ -1,8 +1,8 @@
-"""Image-adaptive CMYK residual 3D LUTs on a fixed ICC baseline.
+"""Image-adaptive CMYK residual LUTs on a fixed ICC baseline.
 
-Global and portrait encoders are small CNNs. They emit a 17³×4 residual LUT
-and a confidence volume from a 256×256 thumbnail. Lookup is keyed by RGB;
-the residual is added to ICC(sRGB). Loss is against the human CMYK target.
+Encoders emit a 1D luma S-curve (contrast/density), a 17³×4 RGB-keyed residual
+for hue shifts, and a confidence volume. The 3D residual is mean-centred so
+it cannot carry the S-curve. Loss is against the human CMYK target.
 """
 
 from __future__ import annotations
@@ -32,7 +32,9 @@ THUMBNAIL = 256
 DEFAULT_GRID = 17
 DEFAULT_CHANNELS = 32
 LUT_CHANNELS = 4
-MODEL_TYPE = "adaptive_cmyk_lut_v1"
+DEFAULT_TONE_BINS = 17
+MODEL_TYPE = "adaptive_cmyk_lut_v2"
+MODEL_TYPE_V1 = "adaptive_cmyk_lut_v1"
 
 
 def _torch():
@@ -47,21 +49,24 @@ def _torch():
     return torch, nn, F
 
 
-def resolve_device(name: str | None = None):
+def resolve_device(name: str | None = None, *, prefer_mps: bool = False):
     torch, _, _ = _torch()
-    if name:
-        device = torch.device(name)
-        if device.type == "mps" and not torch.backends.mps.is_available():
-            raise ValueError(
-                "MPS 不可用。需要本机 macOS + Apple Silicon 的 PyTorch；"
-                "Linux / Docker 请用 --device cpu 或 --device cuda"
-            )
-        if device.type == "cuda" and not torch.cuda.is_available():
-            raise ValueError("CUDA 不可用，请改用 --device cpu")
-        return device
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+    requested = ("" if name is None else str(name)).strip().lower()
+    if requested in {"", "auto"}:
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if prefer_mps and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    device = torch.device(name)
+    if device.type == "mps" and not torch.backends.mps.is_available():
+        raise ValueError(
+            "MPS 不可用。需要本机 macOS + Apple Silicon 的 PyTorch；"
+            "Linux / Docker 请用 --device cpu 或 --device cuda"
+        )
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA 不可用，请改用 --device cpu")
+    return device
 
 
 def _numpy_torch_dtype(arr, torch):
@@ -94,11 +99,16 @@ def numpy_to_torch(array, device, dtype=None):
     else:
         storage_dtype = torch_dtype
     try:
-        tensor = torch.frombuffer(bytearray(arr.tobytes()), dtype=storage_dtype).clone()
-        tensor = tensor.reshape(arr.shape)
-    except (RuntimeError, TypeError, ValueError):
-        tensor = torch.tensor(arr.reshape(-1).tolist(), dtype=storage_dtype, device="cpu")
-        tensor = tensor.reshape(arr.shape)
+        tensor = torch.from_numpy(np.array(arr, copy=True, order="C"))
+        if tensor.dtype != storage_dtype:
+            tensor = tensor.to(dtype=storage_dtype)
+    except (RuntimeError, TypeError):
+        try:
+            tensor = torch.frombuffer(bytearray(arr.tobytes()), dtype=storage_dtype).clone()
+            tensor = tensor.reshape(arr.shape)
+        except (RuntimeError, TypeError, ValueError):
+            tensor = torch.tensor(arr.reshape(-1).tolist(), dtype=storage_dtype, device="cpu")
+            tensor = tensor.reshape(arr.shape)
     if torch_dtype == torch.bool:
         tensor = tensor.bool()
     return tensor.to(device)
@@ -137,13 +147,18 @@ class SmallLutEncoder:
     """Built lazily so importing this module does not require torch."""
 
     @staticmethod
-    def create(grid_size: int = DEFAULT_GRID, channels: int = DEFAULT_CHANNELS):
+    def create(
+        grid_size: int = DEFAULT_GRID,
+        channels: int = DEFAULT_CHANNELS,
+        tone_bins: int = DEFAULT_TONE_BINS,
+    ):
         torch, nn, _ = _torch()
 
         class _Encoder(nn.Module):
             def __init__(self):
                 super().__init__()
                 self.grid_size = grid_size
+                self.tone_bins = tone_bins
                 c = channels
                 self.backbone = nn.Sequential(
                     nn.Conv2d(3, c, 3, 2, 1), nn.ReLU(inplace=True),
@@ -157,19 +172,45 @@ class SmallLutEncoder:
                 nodes = grid_size ** 3
                 self.lut_head = nn.Linear(feat, LUT_CHANNELS * nodes)
                 self.conf_head = nn.Linear(feat, nodes)
+                self.tone_head = nn.Linear(feat, LUT_CHANNELS * tone_bins)
                 nn.init.zeros_(self.lut_head.weight)
                 nn.init.zeros_(self.lut_head.bias)
                 nn.init.zeros_(self.conf_head.weight)
                 nn.init.constant_(self.conf_head.bias, 1.0)
+                nn.init.zeros_(self.tone_head.weight)
+                nn.init.zeros_(self.tone_head.bias)
 
             def forward(self, image):
                 features = self.backbone(image).flatten(1)
                 n = self.grid_size
                 lut = self.lut_head(features).view(-1, n, n, n, LUT_CHANNELS)
                 confidence = torch.sigmoid(self.conf_head(features)).view(-1, n, n, n)
-                return lut, confidence
+                tone = self.tone_head(features).view(-1, self.tone_bins, LUT_CHANNELS)
+                return lut, confidence, tone
 
         return _Encoder()
+
+
+def unpack_encoder_out(out):
+    if len(out) == 3:
+        return out[0], out[1], out[2]
+    return out[0], out[1], None
+
+
+def rgb_luma(rgb):
+    return (rgb[..., 0] * 0.299 + rgb[..., 1] * 0.587 + rgb[..., 2] * 0.114).clamp(0, 1)
+
+
+def torch_linear_1d(table, luma):
+    """table (T,C), luma (N,) in [0,1] → (N,C). Uses index_select for MPS."""
+    bins = table.shape[0]
+    position = luma.clamp(0, 1) * (bins - 1)
+    lower = position.floor().long()
+    upper = (lower + 1).clamp(max=bins - 1)
+    frac = (position - lower.float()).unsqueeze(-1)
+    lo = table.index_select(0, lower)
+    hi = table.index_select(0, upper)
+    return lo * (1 - frac) + hi * frac
 
 
 def torch_trilinear(table, rgb):
@@ -204,11 +245,45 @@ def torch_trilinear(table, rgb):
     return result.squeeze(-1) if squeeze else result
 
 
-def apply_lut_torch(rgb, baseline, lut, confidence):
-    """RGB-keyed residual added to an ICC CMYK baseline."""
-    residual = torch_trilinear(lut, rgb)
-    gate = torch_trilinear(confidence.unsqueeze(-1), rgb)
-    return (baseline + gate * residual).clamp(0, 1)
+def torch_trilinear_fast(table, rgb):
+    """Inference 3D lookup via grid_sample. Faster on CPU than numpy or MPS gathers."""
+    torch, _, F = _torch()
+    squeeze = table.dim() == 3
+    if squeeze:
+        table = table.unsqueeze(-1)
+    volume = table.permute(3, 0, 1, 2).unsqueeze(0).contiguous()
+    grid = torch.stack((rgb[:, 2], rgb[:, 1], rgb[:, 0]), dim=-1).clamp(0, 1)
+    grid = grid.mul(2).sub(1).view(1, 1, 1, -1, 3)
+    sampled = F.grid_sample(
+        volume, grid, mode="bilinear", padding_mode="border", align_corners=True,
+    )
+    result = sampled.reshape(volume.shape[1], -1).transpose(0, 1).contiguous()
+    return result.squeeze(-1) if squeeze else result
+
+
+def apply_correction_torch(rgb, baseline, lut, confidence, tone=None, chroma_only=False, fast=False):
+    """ICC baseline + optional 1D luma S-curve + gated 3D residual."""
+    lookup = torch_trilinear_fast if fast else torch_trilinear
+    residual = lookup(lut, rgb)
+    if chroma_only:
+        residual = residual - residual.mean(dim=-1, keepdim=True)
+    gate = lookup(confidence.unsqueeze(-1), rgb)
+    out = baseline + gate * residual
+    if tone is not None:
+        out = out + torch_linear_1d(tone, rgb_luma(rgb))
+    return out.clamp(0, 1)
+
+
+def apply_lut_torch(rgb, baseline, lut, confidence, tone=None, chroma_only=False):
+    return apply_correction_torch(
+        rgb, baseline, lut, confidence, tone, chroma_only, fast=False,
+    )
+
+
+def apply_lut_torch_fast(rgb, baseline, lut, confidence, tone=None, chroma_only=False):
+    return apply_correction_torch(
+        rgb, baseline, lut, confidence, tone, chroma_only, fast=True,
+    )
 
 
 def apply_lut_numpy(
@@ -217,6 +292,8 @@ def apply_lut_numpy(
     lut: np.ndarray,
     confidence: np.ndarray,
     chunk_rows: int = 128,
+    tone: np.ndarray | None = None,
+    chroma_only: bool = False,
 ) -> np.ndarray:
     if rgb.ndim == 3 and rgb.shape[0] > chunk_rows > 0:
         parts = [
@@ -226,13 +303,57 @@ def apply_lut_numpy(
                 lut,
                 confidence,
                 chunk_rows=0,
+                tone=tone,
+                chroma_only=chroma_only,
             )
             for y in range(0, rgb.shape[0], chunk_rows)
         ]
         return np.concatenate(parts, axis=0)
     residual = trilinear_lookup(lut, rgb)
+    if chroma_only:
+        residual = residual - residual.mean(axis=-1, keepdims=True)
     gate = trilinear_lookup(confidence, rgb)
-    return np.clip(baseline + gate[..., None] * residual, 0.0, 1.0)
+    out = baseline + gate[..., None] * residual
+    if tone is not None:
+        luma = np.clip(
+            rgb[..., 0] * 0.299 + rgb[..., 1] * 0.587 + rgb[..., 2] * 0.114, 0.0, 1.0,
+        )
+        bins = tone.shape[0]
+        position = luma * (bins - 1)
+        lower = np.floor(position).astype(np.int64)
+        upper = np.minimum(lower + 1, bins - 1)
+        frac = (position - lower)[..., None]
+        out = out + tone[lower] * (1.0 - frac) + tone[upper] * frac
+    return np.clip(out, 0.0, 1.0)
+
+
+def apply_lut_on_device(
+    rgb, baseline, lut, confidence, device, chunk_rows: int = 128,
+    tone=None, chroma_only: bool = False,
+):
+    """Apply 1D tone + 3D residual. Interpolation runs on CPU."""
+    del device, chunk_rows
+    torch, _, _ = _torch()
+    cpu = torch.device("cpu")
+    if hasattr(lut, "detach"):
+        lut = lut.detach().to(cpu)
+        confidence = confidence.detach().to(cpu)
+        tone = None if tone is None else tone.detach().to(cpu)
+    else:
+        lut = numpy_to_torch(lut, cpu)
+        confidence = numpy_to_torch(confidence, cpu)
+        tone = None if tone is None else numpy_to_torch(tone, cpu)
+    rgb = np.ascontiguousarray(rgb, dtype=np.float32)
+    baseline = np.ascontiguousarray(baseline, dtype=np.float32)
+    spatial = rgb.shape[:2] if rgb.ndim == 3 else None
+    with torch.no_grad():
+        pred = apply_lut_torch_fast(
+            numpy_to_torch(rgb.reshape(-1, 3), cpu),
+            numpy_to_torch(baseline.reshape(-1, 4), cpu),
+            lut, confidence, tone, chroma_only,
+        )
+        out = tensor_to_numpy(pred)
+    return out.reshape(spatial[0], spatial[1], 4) if spatial else out
 
 
 def lut_smoothness(lut):
@@ -240,6 +361,10 @@ def lut_smoothness(lut):
     dy = (lut[:, 1:] - lut[:, :-1]).abs().mean()
     dz = (lut[:, :, 1:] - lut[:, :, :-1]).abs().mean()
     return (dx + dy + dz) / 3.0
+
+
+def tone_smoothness(tone):
+    return (tone[1:] - tone[:-1]).abs().mean()
 
 
 class AdaptiveLUTModel:
@@ -263,16 +388,26 @@ class AdaptiveLUTModel:
         self.metadata = metadata
 
     @property
+    def tone_split(self) -> bool:
+        return bool(self.metadata.get("tone_split", self.metadata.get("model_type") == MODEL_TYPE))
+
+    @property
     def portrait_region(self) -> str:
         return portrait_region_from_metadata(self.metadata)
 
-    def encode_lut(self, encoder, image: Image.Image) -> tuple[np.ndarray, np.ndarray]:
+    def encode_lut_tensors(self, encoder, image: Image.Image):
         torch, _, _ = _torch()
         with torch.no_grad():
-            lut, confidence = encoder(image_to_tensor(image, self.device))
+            out = encoder(image_to_tensor(image, self.device))
+        lut, confidence, tone = unpack_encoder_out(out)
+        return lut[0], confidence[0], None if tone is None else tone[0]
+
+    def encode_lut(self, encoder, image: Image.Image):
+        lut, confidence, tone = self.encode_lut_tensors(encoder, image)
         return (
-            tensor_to_numpy(lut[0]).astype(np.float32),
-            tensor_to_numpy(confidence[0]).astype(np.float32),
+            tensor_to_numpy(lut).astype(np.float32),
+            tensor_to_numpy(confidence).astype(np.float32),
+            None if tone is None else tensor_to_numpy(tone).astype(np.float32),
         )
 
     def icc_baseline(self, source: Image.Image) -> np.ndarray:
@@ -295,10 +430,13 @@ class AdaptiveLUTModel:
     ) -> np.ndarray:
         if thumb is None:
             thumb = resize_square(rgb_u8, int(self.metadata.get("thumbnail", THUMBNAIL)))
-        lut, confidence = self.encode_lut(self.global_encoder, thumb)
+        lut, confidence, tone = self.encode_lut_tensors(self.global_encoder, thumb)
         if rgb is None:
             rgb = rgb_u8.astype(np.float32) / 255.0
-        corrected = apply_lut_numpy(rgb, baseline, lut, confidence, chunk_rows)
+        corrected = apply_lut_on_device(
+            rgb, baseline, lut, confidence, self.device, chunk_rows,
+            tone=tone, chroma_only=self.tone_split,
+        )
         if self.portrait_encoder is None:
             return corrected
         region = self.portrait_region
@@ -308,8 +446,11 @@ class AdaptiveLUTModel:
         )
         if crop is None:
             return corrected
-        p_lut, p_conf = self.encode_lut(self.portrait_encoder, crop)
-        portrait = apply_lut_numpy(rgb, corrected, p_lut, p_conf, chunk_rows)
+        p_lut, p_conf, p_tone = self.encode_lut_tensors(self.portrait_encoder, crop)
+        portrait = apply_lut_on_device(
+            rgb, corrected, p_lut, p_conf, self.device, chunk_rows,
+            tone=p_tone, chroma_only=self.tone_split,
+        )
         weight = mask.reshape(-1)[sample_idx][..., None] if sample_idx is not None else mask[..., None]
         return np.clip((1.0 - weight) * corrected + weight * portrait, 0.0, 1.0)
 
@@ -354,6 +495,7 @@ class AdaptiveLUTModel:
             "grid_size": int(self.metadata.get("grid_size", DEFAULT_GRID)),
             "channels": int(self.metadata.get("encoder_channels", DEFAULT_CHANNELS)),
             "lut_channels": LUT_CHANNELS,
+            "tone_bins": int(self.metadata.get("tone_bins", DEFAULT_TONE_BINS)),
             "thumbnail": int(self.metadata.get("thumbnail", THUMBNAIL)),
             "global_state": self.global_encoder.state_dict(),
             "portrait_state": None if self.portrait_encoder is None else self.portrait_encoder.state_dict(),
@@ -375,17 +517,21 @@ class AdaptiveLUTModel:
             raise ValueError(
                 f"{path} 是旧的自适应 RGB LUT，无法加载。请用 CMYK 残差路径重训"
             )
-        if model_type != MODEL_TYPE:
+        if model_type not in {MODEL_TYPE, MODEL_TYPE_V1}:
             raise ValueError(f"不是自适应 CMYK LUT 模型：{path}")
         metadata = json.loads(payload["metadata"])
         grid = int(payload.get("grid_size", metadata.get("grid_size", DEFAULT_GRID)))
         channels = int(payload.get("channels", metadata.get("encoder_channels", DEFAULT_CHANNELS)))
-        global_encoder = SmallLutEncoder.create(grid, channels)
-        global_encoder.load_state_dict(payload["global_state"])
+        tone_bins = int(payload.get("tone_bins", metadata.get("tone_bins", DEFAULT_TONE_BINS)))
+        global_encoder = SmallLutEncoder.create(grid, channels, tone_bins)
+        strict = model_type == MODEL_TYPE
+        global_encoder.load_state_dict(payload["global_state"], strict=strict)
         portrait_encoder = None
         if payload.get("portrait_state") is not None:
-            portrait_encoder = SmallLutEncoder.create(grid, channels)
-            portrait_encoder.load_state_dict(payload["portrait_state"])
+            portrait_encoder = SmallLutEncoder.create(grid, channels, tone_bins)
+            portrait_encoder.load_state_dict(payload["portrait_state"], strict=strict)
+        if model_type == MODEL_TYPE_V1:
+            metadata.setdefault("tone_split", False)
         return cls(
             global_encoder, payload["target_icc"], metadata, portrait_encoder, device,
         )

@@ -6,16 +6,18 @@
 
 ```text
 Input RGB
-    ├─ ICC ──────────────────────────────► CMYK 基线
-    ├─ Global Encoder (Small CNN) → 17³×4 残差 + Confidence
-    └─ MediaPipe Person/Skin → Crop → Portrait Encoder → 17³×4 残差
+    ├─ ICC ──────────────────────────────────────► CMYK 基线
+    ├─ Global Encoder (Small CNN)
+    │     ├─ 1D luma S-curve（反差/密度）
+    │     └─ 17³×4 偏色残差 + Confidence
+    └─ MediaPipe Person/Skin → Crop → Portrait Encoder（同样 1D + 3D）
          ↓
-    CMYK = ICC + 全局残差 + 遮罩 × 人像残差
+    CMYK = ICC + 1D_S(luma) + gate × (3D − mean) + 遮罩 × 人像同结构
          ↓
     edge-lift → Final CMYK
 ```
 
-全图 CNN 看 256×256 缩略图，生成按 RGB 查表的 17³×4（ΔC/ΔM/ΔY/ΔK）残差和置信度。人像分支用 MediaPipe 抠人（或皮肤），裁切后再编码第二张残差 LUT，只在遮罩内叠到全局结果上。ICC 只做固定基线、不反传。训练损失直接对人工 CMYK target，暗部和高光比中间调权重大（`--luma-weight`），以便拟合调图师的 S 曲线。已有 `adaptive_rgb_lut_v1` 的 `.pt` 不能接着训，必须重训。
+全图 CNN 看 256×256 缩略图。一条按亮度 `0.299R+0.587G+0.114B` 查的 1 维 S 曲线管反差和密度；17³×4 残差对 CMYK 做均值中心化，只学偏色，不能再偷走 S。人像分支用 MediaPipe 抠人（或皮肤），裁切后再编码第二套 1D+3D，只在遮罩内叠到全局结果上。ICC 只做固定基线、不反传。训练损失直接对人工 CMYK target，暗部和高光比中间调权重大（`--luma-weight`）。已有 `adaptive_cmyk_lut_v1` / `adaptive_rgb_lut_v1` 的 `.pt` **不能**接着用这条拆分，必须从 `--stage global` 重训。v1 仍可加载推理（不拆 S、3D 不去均值）。
 
 需要 PyTorch：
 
@@ -48,6 +50,8 @@ python3 train_adaptive_lut.py \
   --luma-weight 1.0 \
   --lut-l1 0.01 \
   --smoothness 0.03 \
+  --tone-bins 17 \
+  --tone-smoothness 0.03 \
   --seed 42
 
 python3 train_adaptive_lut.py \
@@ -88,12 +92,7 @@ python3 test.py \
   --input in.jpg \
   --output result.tif
 
-python3 server.py \
-  --model models/adaptive_portrait.pt \
-  --data web_data \
-  --host 127.0.0.1 \
-  --port 8765
-```
+Mac 上整图 LUT 插值在 CPU 上（比原先 numpy 查表快，也比 MPS 扫全图快）。CNN 缩略图可用 `--device mps`，一般对总耗时帮助不大。`--device auto` 会选 CUDA，否则 CPU。
 
 `--edge-lift` 仍作用在最终 CMYK 上（默认轮廓减 K）。新训的模型默认**关掉** `--shadow-lift`，以免把调图师压暗的阴影再提亮；需要暗部减墨时再显式传入，例如 `--shadow-lift 0.06`。旧的 `.npz` 若元数据里仍写着 0.06，行为不变。
 

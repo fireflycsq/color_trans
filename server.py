@@ -47,7 +47,7 @@ class AppState:
         max_hue_shift: float = 15.0, max_upload_mb: int = 512,
         edge_lift: float | None = None,
         shadow_lift: float | None = None,
-        device: str | None = "cpu",
+        device: str | None = "auto",
     ):
         self.model = load_color_model(model_path, device=device)
         self.model_path = model_path
@@ -506,8 +506,8 @@ def main() -> None:
         help="dark-tone K lift 0..1; default 0 (off). Use e.g. 0.06 to restore",
     )
     p.add_argument(
-        "--device", default="cpu",
-        help="PyTorch device for .pt models. Web default is cpu",
+        "--device", default="auto",
+        help="PyTorch device for .pt models: auto, cpu, mps, or cuda",
     )
     args = p.parse_args()
     if args.max_upload_mb <= 0:
@@ -525,7 +525,7 @@ def main() -> None:
     server.app = app  # type: ignore[attr-defined]
     print(f"Color Review running at http://{args.host}:{args.port}")
     print(f"Model: {Path(args.model).resolve()}")
-    print(f"Device: {args.device}")
+    print(f"Device: {getattr(app.model, 'device', args.device)}")
     if args.edge_lift is not None:
         print(f"Edge lift: {args.edge_lift:g}")
     if args.shadow_lift is not None:

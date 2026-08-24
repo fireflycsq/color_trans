@@ -53,13 +53,17 @@ def main() -> None:
         "--shadow-lift", type=float, default=None,
         help="dark-tone K lift 0..1; default 0 (off). Use e.g. 0.06 to restore",
     )
+    p.add_argument(
+        "--device", default="auto",
+        help="PyTorch device for .pt models: auto, cpu, mps, or cuda",
+    )
     args = p.parse_args()
     if args.edge_lift is not None and args.edge_lift < 0:
         raise ValueError("--edge-lift 不能为负数")
     if args.shadow_lift is not None and args.shadow_lift < 0:
         raise ValueError("--shadow-lift 不能为负数")
 
-    model = load_color_model(args.model)
+    model = load_color_model(args.model, device=args.device)
     src = Image.open(args.input)
     pred = model.predict_image(src, edge_lift=args.edge_lift, shadow_lift=args.shadow_lift)
     out = Path(args.output)
@@ -82,7 +86,10 @@ def main() -> None:
         if shadow_k > 0 or shadow_cmy > 0:
             extras.append(f"shadow-lift K={shadow_k:g} CMY={shadow_cmy:g}")
     extra = f", {', '.join(extras)}" if extras else ""
-    print(f"saved: {out.resolve()} ({pred.mode}, embedded {model.metadata['target_profile']}{extra})")
+    device_note = ""
+    if isinstance(model, AdaptiveLUTModel):
+        device_note = f", device={model.device}"
+    print(f"saved: {out.resolve()} ({pred.mode}, embedded {model.metadata['target_profile']}{extra}{device_note})")
     if args.save_portrait_mask:
         region = portrait_region_from_metadata(getattr(model, "metadata", {}))
         mask = portrait_mask(np.asarray(image_to_srgb(src), dtype=np.uint8), region=region)
