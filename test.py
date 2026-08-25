@@ -65,9 +65,12 @@ def main() -> None:
     )
     p.add_argument(
         "--de-gray", action=argparse.BooleanOptionalAction, default=True,
-        help="write shadow lift / S / saturation into the saved CMYK or JPEG",
+        help="write black crush / S / saturation into the saved CMYK or JPEG",
     )
-    p.add_argument("--de-gray-shadow-lift", type=float, default=0.3)
+    p.add_argument(
+        "--de-gray-shadow-lift", type=float, default=0.0,
+        help="optional gamma shadow lift 0..1; default 0 so night blacks stay down",
+    )
     p.add_argument("--de-gray-strength", type=float, default=0.6)
     args = p.parse_args()
     if args.edge_lift is not None and args.edge_lift < 0:

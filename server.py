@@ -49,7 +49,7 @@ class AppState:
         shadow_lift: float | None = None,
         device: str | None = "auto",
         de_gray: bool = True,
-        de_gray_shadow_lift: float = 0.3,
+        de_gray_shadow_lift: float = 0.0,
         de_gray_strength: float = 0.6,
     ):
         self.model = load_color_model(model_path, device=device)
@@ -532,11 +532,11 @@ def main() -> None:
     )
     p.add_argument(
         "--de-gray", action=argparse.BooleanOptionalAction, default=True,
-        help="write shadow lift / S / saturation into the CMYK output (and matching preview)",
+        help="write black crush / S / saturation into the CMYK output (and matching preview)",
     )
     p.add_argument(
-        "--de-gray-shadow-lift", type=float, default=0.3,
-        help="output shadow lift 0..1; only used with --de-gray",
+        "--de-gray-shadow-lift", type=float, default=0.0,
+        help="optional gamma shadow lift 0..1; default 0 so night blacks stay down",
     )
     p.add_argument(
         "--de-gray-strength", type=float, default=0.6,

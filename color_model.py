@@ -135,17 +135,17 @@ def _apply_transform_rows(image: Image.Image, transform, chunk_rows: int) -> Ima
 
 def avoid_washout_adjust(
     image: Image.Image,
-    shadow_lift: float = 0.3,
+    shadow_lift: float = 0.0,
     strength: float = 0.6,
     black_pct: float = 1.0,
     white_pct: float = 99.0,
+    black_max: float = 0.18,
 ) -> Image.Image:
-    """Restore contrast and chroma on a display-referred sRGB preview.
+    """Crush a gray fog on a display-referred sRGB view of CMYK.
 
-    CMYK→sRGB relative colorimetric often looks gray next to the RGB original.
-    This lifts shadows, stretches per-channel black/white points, applies a mild
-    S-curve, and boosts Lab chroma. Used on the sRGB view of a CMYK result, then
-    converted back through the target ICC so the saved file matches the preview.
+    Night/target comparisons need true blacks. A shared luma black/white stretch
+    removes the veil without per-channel hue shifts. Optional shadow_lift is a
+    gamma lift and stays off by default — it fights deep blacks.
     """
     rgb = image.convert("RGB")
     img_f = np.asarray(rgb, dtype=np.float32) / 255.0
@@ -156,10 +156,14 @@ def avoid_washout_adjust(
         gamma = 1.0 - np.clip(shadow_lift, 0.0, 1.0) * 0.4
         img_f = np.power(np.clip(img_f, 0.0, 1.0), gamma)
 
-    black_point = np.percentile(img_f, black_pct, axis=(0, 1), keepdims=True)
-    white_point = np.percentile(img_f, white_pct, axis=(0, 1), keepdims=True)
-    black_point = np.clip(black_point, 0.0, 0.05)
-    white_point = np.clip(white_point, 0.90, 1.0)
+    luma = np.clip(
+        img_f[..., 0] * 0.299 + img_f[..., 1] * 0.587 + img_f[..., 2] * 0.114,
+        0.0, 1.0,
+    )
+    black_point = float(np.percentile(luma, black_pct))
+    white_point = float(np.percentile(luma, white_pct))
+    black_point = min(max(black_point, 0.0), black_max)
+    white_point = min(max(white_point, 0.90), 1.0)
     img_f = (img_f - black_point) / (white_point - black_point + 1e-6)
     img_f = np.clip(img_f, 0.0, 1.0)
 
@@ -189,7 +193,7 @@ def avoid_washout_adjust(
 def de_gray_cmyk(
     image: Image.Image,
     icc: bytes,
-    shadow_lift: float = 0.3,
+    shadow_lift: float = 0.0,
     strength: float = 0.6,
     black_pct: float = 1.0,
     white_pct: float = 99.0,
@@ -210,7 +214,7 @@ def render_cmyk_preview(
     image: Image.Image,
     icc: bytes,
     de_gray: bool = False,
-    shadow_lift: float = 0.3,
+    shadow_lift: float = 0.0,
     strength: float = 0.6,
     black_pct: float = 1.0,
     white_pct: float = 99.0,
