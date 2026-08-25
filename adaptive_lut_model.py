@@ -218,10 +218,10 @@ class SmallLutEncoder:
                     self.look_head.bias.data.copy_(
                         torch.tensor(
                             [
-                                _logit(0.18),
-                                _logit(0.6),
-                                _logit(0.55),
-                                _logit(0.6),
+                                _logit(0.01),
+                                _logit(0.01),
+                                _logit(0.01),
+                                _logit(0.99),
                                 0.0,
                                 0.0,
                             ],
@@ -409,25 +409,33 @@ def soft_highlights_torch(img, start: float = 0.78, ceiling=0.94):
 
 
 def apply_washout_torch(rgb, black, white, look_raw):
-    """Differentiable version of avoid_washout_adjust; black/white are image-level."""
+    """Look starts near identity: stretch/S/cool are blended by learned amounts.
+
+    Histogram black/white are only mixed in by ``strength``. A full percentile
+    stretch on every image is what made v3 lose to the ICC baseline on ΔE.
+    """
     torch, _, _ = _torch()
     shadow_lift, strength, cool, highlight_ceiling, black_delta, white_delta = decode_look(look_raw)
     black_p = (black + black_delta).clamp(0.0, 0.18)
     white_p = (white + white_delta).clamp(min=black_p + 0.20).clamp(max=1.0)
-    img = (rgb - black_p) / (white_p - black_p).clamp(min=1e-6)
-    over = (img - 1.0).clamp(min=0.0)
+    stretched = (rgb - black_p) / (white_p - black_p).clamp(min=1e-6)
+    amt = strength.clamp(0, 1)
+    img = (1.0 - amt) * rgb + amt * stretched
+    over = amt * (stretched - 1.0).clamp(min=0.0)
     img = img.clamp(0, 1)
     gamma = 1.0 - shadow_lift.clamp(0, 1) * 0.35
     img = img.clamp(min=1e-8).pow(gamma)
-    s_strength = strength.clamp(0, 1) * 0.40
+    s_strength = amt * 0.40
     s_curved = torch.sigmoid(6.0 * (img - 0.5))
     s_min = 1.0 / (1.0 + torch.exp(img.new_tensor(3.0)))
     s_max = 1.0 / (1.0 + torch.exp(img.new_tensor(-3.0)))
     s_curved = (s_curved - s_min) / (s_max - s_min)
     img = (1.0 - s_strength) * img + s_strength * s_curved
-    img = soft_highlights_torch(img + over, ceiling=highlight_ceiling).clamp(0, 1)
+    roll_amt = ((1.0 - highlight_ceiling) / 0.15).clamp(0, 1)
+    rolled = soft_highlights_torch(img + over, ceiling=highlight_ceiling)
+    img = ((1.0 - roll_amt) * img + roll_amt * rolled).clamp(0, 1)
     lab = srgb_to_lab_torch(img)
-    sat_gain = 1.0 + strength.clamp(0, 1) * 0.22
+    sat_gain = 1.0 + amt * 0.22
     ab = lab[..., 1:] * sat_gain
     L = lab[..., 0]
     gate = ((L - 32.0) / 36.0).clamp(0, 1) * ((98.0 - L) / 28.0).clamp(0, 1)

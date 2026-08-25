@@ -339,8 +339,9 @@ def parse_args() -> argparse.Namespace:
         help="Huber delta in scaled Lab (L/50, a/25, b/25)",
     )
     p.add_argument(
-        "--icc-look-weight", type=float, default=0.35,
-        help="extra Lab loss: look(ICC baseline sRGB) vs target sRGB; 0 disables",
+        "--icc-look-weight", type=float, default=0.0,
+        help="extra Lab loss: look(ICC baseline sRGB) vs target sRGB; 0 disables "
+        "(default 0: this term pushes a display de-gray onto ICC and often worsens CMYK ΔE)",
     )
     p.add_argument(
         "--absolute-tone", action="store_true",
