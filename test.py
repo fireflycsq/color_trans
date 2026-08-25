@@ -68,8 +68,8 @@ def main() -> None:
         help="write black crush / S / saturation into the saved CMYK or JPEG",
     )
     p.add_argument(
-        "--de-gray-shadow-lift", type=float, default=0.0,
-        help="optional gamma shadow lift 0..1; default 0 so night blacks stay down",
+        "--de-gray-shadow-lift", type=float, default=0.25,
+        help="midtone lift 0..1 after black crush; brightens without lifting crushed blacks",
     )
     p.add_argument("--de-gray-strength", type=float, default=0.6)
     args = p.parse_args()

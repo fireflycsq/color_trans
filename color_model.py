@@ -135,39 +135,38 @@ def _apply_transform_rows(image: Image.Image, transform, chunk_rows: int) -> Ima
 
 def avoid_washout_adjust(
     image: Image.Image,
-    shadow_lift: float = 0.0,
+    shadow_lift: float = 0.25,
     strength: float = 0.6,
     black_pct: float = 1.0,
     white_pct: float = 99.0,
     black_max: float = 0.18,
 ) -> Image.Image:
-    """Crush a gray fog on a display-referred sRGB view of CMYK.
+    """Match a punchy human grade: crush gray fog, then brighten mids/highlights.
 
-    Night/target comparisons need true blacks. A shared luma black/white stretch
-    removes the veil without per-channel hue shifts. Optional shadow_lift is a
-    gamma lift and stays off by default — it fights deep blacks.
+    The model CMYK is often underexposed versus the target. White is stretched
+    to the actual highlight percentile (not clamped to 0.90, which kept dark
+    frames dark). Midtone gamma runs after the black crush so 0 stays 0.
     """
     rgb = image.convert("RGB")
     img_f = np.asarray(rgb, dtype=np.float32) / 255.0
     if img_f.size == 0:
         return rgb
 
-    if shadow_lift > 0:
-        gamma = 1.0 - np.clip(shadow_lift, 0.0, 1.0) * 0.4
-        img_f = np.power(np.clip(img_f, 0.0, 1.0), gamma)
-
     luma = np.clip(
         img_f[..., 0] * 0.299 + img_f[..., 1] * 0.587 + img_f[..., 2] * 0.114,
         0.0, 1.0,
     )
-    black_point = float(np.percentile(luma, black_pct))
+    black_point = min(max(float(np.percentile(luma, black_pct)), 0.0), black_max)
     white_point = float(np.percentile(luma, white_pct))
-    black_point = min(max(black_point, 0.0), black_max)
-    white_point = min(max(white_point, 0.90), 1.0)
+    white_point = min(max(white_point, black_point + 0.20), 1.0)
     img_f = (img_f - black_point) / (white_point - black_point + 1e-6)
     img_f = np.clip(img_f, 0.0, 1.0)
 
-    s_strength = np.clip(strength, 0.0, 1.0) * 0.35
+    if shadow_lift > 0:
+        gamma = 1.0 - np.clip(shadow_lift, 0.0, 1.0) * 0.35
+        img_f = np.power(img_f, gamma)
+
+    s_strength = np.clip(strength, 0.0, 1.0) * 0.40
     if s_strength > 0:
         s_curved = 1.0 / (1.0 + np.exp(-6.0 * (img_f - 0.5)))
         s_min = 1.0 / (1.0 + np.exp(3.0))
@@ -177,7 +176,7 @@ def avoid_washout_adjust(
         img_f = np.clip(img_f, 0.0, 1.0)
 
     if strength > 0:
-        sat_gain = 1.0 + np.clip(strength, 0.0, 1.0) * 0.15
+        sat_gain = 1.0 + np.clip(strength, 0.0, 1.0) * 0.22
         rows = []
         chunk = 256
         for y in range(0, img_f.shape[0], chunk):
@@ -193,7 +192,7 @@ def avoid_washout_adjust(
 def de_gray_cmyk(
     image: Image.Image,
     icc: bytes,
-    shadow_lift: float = 0.0,
+    shadow_lift: float = 0.25,
     strength: float = 0.6,
     black_pct: float = 1.0,
     white_pct: float = 99.0,
@@ -214,7 +213,7 @@ def render_cmyk_preview(
     image: Image.Image,
     icc: bytes,
     de_gray: bool = False,
-    shadow_lift: float = 0.0,
+    shadow_lift: float = 0.25,
     strength: float = 0.6,
     black_pct: float = 1.0,
     white_pct: float = 99.0,
