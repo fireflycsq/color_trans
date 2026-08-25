@@ -26,19 +26,45 @@ def polynomial_features(rgb: np.ndarray) -> np.ndarray:
     )
 
 
+_SRGB_TO_XYZ = np.array([
+    [0.4124564, 0.3575761, 0.1804375],
+    [0.2126729, 0.7151522, 0.0721750],
+    [0.0193339, 0.1191920, 0.9503041],
+], dtype=np.float64)
+_XYZ_TO_SRGB = np.linalg.inv(_SRGB_TO_XYZ)
+_XYZ_WHITE = np.array([0.95047, 1.0, 1.08883], dtype=np.float64)
+
+
 def srgb_to_lab(rgb: np.ndarray) -> np.ndarray:
     """Convert an sRGB float array in [0, 1] to CIE Lab (D65)."""
     rgb = np.asarray(rgb, dtype=np.float64)
     lin = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
-    xyz = lin @ np.array([
-        [0.4124564, 0.3575761, 0.1804375],
-        [0.2126729, 0.7151522, 0.0721750],
-        [0.0193339, 0.1191920, 0.9503041],
-    ]).T
-    xyz /= np.array([0.95047, 1.0, 1.08883])
+    xyz = lin @ _SRGB_TO_XYZ.T
+    xyz /= _XYZ_WHITE
     d = 6 / 29
-    f = np.where(xyz > d**3, np.cbrt(xyz), xyz / (3*d*d) + 4/29)
-    return np.stack([116*f[..., 1]-16, 500*(f[..., 0]-f[..., 1]), 200*(f[..., 1]-f[..., 2])], axis=-1)
+    f = np.where(xyz > d**3, np.cbrt(xyz), xyz / (3 * d * d) + 4 / 29)
+    return np.stack([116 * f[..., 1] - 16, 500 * (f[..., 0] - f[..., 1]), 200 * (f[..., 1] - f[..., 2])], axis=-1)
+
+
+def lab_to_srgb(lab: np.ndarray) -> np.ndarray:
+    """Convert CIE Lab (D65) to sRGB float in [0, 1]."""
+    lab = np.asarray(lab, dtype=np.float64)
+    fy = (lab[..., 0] + 16.0) / 116.0
+    fx = lab[..., 1] / 500.0 + fy
+    fz = fy - lab[..., 2] / 200.0
+    d = 6 / 29
+    xyz = np.stack(
+        [
+            np.where(fx > d, fx ** 3, (fx - 4 / 29) * 3 * d * d),
+            np.where(fy > d, fy ** 3, (fy - 4 / 29) * 3 * d * d),
+            np.where(fz > d, fz ** 3, (fz - 4 / 29) * 3 * d * d),
+        ],
+        axis=-1,
+    )
+    xyz *= _XYZ_WHITE
+    lin = xyz @ _XYZ_TO_SRGB.T
+    rgb = np.where(lin <= 0.0031308, lin * 12.92, 1.055 * np.power(np.clip(lin, 0, None), 1 / 2.4) - 0.055)
+    return np.clip(rgb, 0.0, 1.0)
 
 
 def profile_from_bytes(data: bytes) -> ImageCms.ImageCmsProfile:
@@ -73,12 +99,133 @@ def image_to_srgb(image: Image.Image) -> Image.Image:
     return apply_embedded_srgb(image)
 
 
-def render_cmyk_to_srgb(image: Image.Image, icc: bytes) -> Image.Image:
+def render_cmyk_to_srgb(image: Image.Image, icc: bytes, chunk_rows: int = 256) -> Image.Image:
     """Render CMYK through its output profile into display sRGB."""
     src = profile_from_bytes(icc)
     dst = ImageCms.createProfile("sRGB")
     transform = ImageCms.buildTransform(src, dst, "CMYK", "RGB", renderingIntent=1)
-    return ImageCms.applyTransform(image.convert("CMYK"), transform)
+    cmyk = image.convert("CMYK")
+    return _apply_transform_rows(cmyk, transform, chunk_rows)
+
+
+def srgb_to_cmyk(image: Image.Image, icc: bytes, chunk_rows: int = 256) -> Image.Image:
+    """Convert display sRGB into the model's target CMYK profile."""
+    src = ImageCms.createProfile("sRGB")
+    dst = profile_from_bytes(icc)
+    transform = ImageCms.buildTransform(
+        src, dst, "RGB", "CMYK", renderingIntent=1,
+        flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
+    )
+    return _apply_transform_rows(image.convert("RGB"), transform, chunk_rows)
+
+
+def _apply_transform_rows(image: Image.Image, transform, chunk_rows: int) -> Image.Image:
+    width, height = image.size
+    if chunk_rows <= 0 or height <= chunk_rows:
+        return ImageCms.applyTransform(image, transform)
+    parts = []
+    mode = None
+    for y in range(0, height, chunk_rows):
+        strip = image.crop((0, y, width, min(y + chunk_rows, height)))
+        converted = ImageCms.applyTransform(strip, transform)
+        mode = converted.mode
+        parts.append(np.asarray(converted, dtype=np.uint8))
+    return Image.fromarray(np.concatenate(parts, axis=0), mode)
+
+
+def avoid_washout_adjust(
+    image: Image.Image,
+    shadow_lift: float = 0.3,
+    strength: float = 0.6,
+    black_pct: float = 1.0,
+    white_pct: float = 99.0,
+) -> Image.Image:
+    """Restore contrast and chroma on a display-referred sRGB preview.
+
+    CMYK→sRGB relative colorimetric often looks gray next to the RGB original.
+    This lifts shadows, stretches per-channel black/white points, applies a mild
+    S-curve, and boosts Lab chroma. Used on the sRGB view of a CMYK result, then
+    converted back through the target ICC so the saved file matches the preview.
+    """
+    rgb = image.convert("RGB")
+    img_f = np.asarray(rgb, dtype=np.float32) / 255.0
+    if img_f.size == 0:
+        return rgb
+
+    if shadow_lift > 0:
+        gamma = 1.0 - np.clip(shadow_lift, 0.0, 1.0) * 0.4
+        img_f = np.power(np.clip(img_f, 0.0, 1.0), gamma)
+
+    black_point = np.percentile(img_f, black_pct, axis=(0, 1), keepdims=True)
+    white_point = np.percentile(img_f, white_pct, axis=(0, 1), keepdims=True)
+    black_point = np.clip(black_point, 0.0, 0.05)
+    white_point = np.clip(white_point, 0.90, 1.0)
+    img_f = (img_f - black_point) / (white_point - black_point + 1e-6)
+    img_f = np.clip(img_f, 0.0, 1.0)
+
+    s_strength = np.clip(strength, 0.0, 1.0) * 0.35
+    if s_strength > 0:
+        s_curved = 1.0 / (1.0 + np.exp(-6.0 * (img_f - 0.5)))
+        s_min = 1.0 / (1.0 + np.exp(3.0))
+        s_max = 1.0 / (1.0 + np.exp(-3.0))
+        s_curved = (s_curved - s_min) / (s_max - s_min)
+        img_f = (1.0 - s_strength) * img_f + s_strength * s_curved
+        img_f = np.clip(img_f, 0.0, 1.0)
+
+    if strength > 0:
+        sat_gain = 1.0 + np.clip(strength, 0.0, 1.0) * 0.15
+        rows = []
+        chunk = 256
+        for y in range(0, img_f.shape[0], chunk):
+            lab = srgb_to_lab(img_f[y:y + chunk])
+            lab[..., 1:] *= sat_gain
+            rows.append(lab_to_srgb(lab).astype(np.float32))
+        img_f = np.concatenate(rows, axis=0)
+
+    out = np.rint(np.clip(img_f, 0.0, 1.0) * 255.0).astype(np.uint8)
+    return Image.fromarray(out, "RGB")
+
+
+def de_gray_cmyk(
+    image: Image.Image,
+    icc: bytes,
+    shadow_lift: float = 0.3,
+    strength: float = 0.6,
+    black_pct: float = 1.0,
+    white_pct: float = 99.0,
+) -> Image.Image:
+    """Apply washout correction in sRGB and write it back to target CMYK."""
+    rgb = render_cmyk_to_srgb(image, icc)
+    rgb = avoid_washout_adjust(
+        rgb,
+        shadow_lift=shadow_lift,
+        strength=strength,
+        black_pct=black_pct,
+        white_pct=white_pct,
+    )
+    return srgb_to_cmyk(rgb, icc)
+
+
+def render_cmyk_preview(
+    image: Image.Image,
+    icc: bytes,
+    de_gray: bool = False,
+    shadow_lift: float = 0.3,
+    strength: float = 0.6,
+    black_pct: float = 1.0,
+    white_pct: float = 99.0,
+) -> Image.Image:
+    """ICC-render CMYK to sRGB. Optional extra de-gray if the CMYK is not already adjusted."""
+    preview = render_cmyk_to_srgb(image, icc)
+    if not de_gray:
+        return preview
+    return avoid_washout_adjust(
+        preview,
+        shadow_lift=shadow_lift,
+        strength=strength,
+        black_pct=black_pct,
+        white_pct=white_pct,
+    )
 
 
 def hue_and_saturation(rgb_u8: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

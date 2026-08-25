@@ -96,6 +96,8 @@ Mac 上整图 LUT 插值在 CPU 上（比原先 numpy 查表快，也比 MPS 扫
 
 `--edge-lift` 仍作用在最终 CMYK 上（默认轮廓减 K）。新训的模型默认**关掉** `--shadow-lift`，以免把调图师压暗的阴影再提亮；需要暗部减墨时再显式传入，例如 `--shadow-lift 0.06`。旧的 `.npz` 若元数据里仍写着 0.06，行为不变。
 
+默认还会把**去灰写进最终输出**：CMYK→sRGB 后做暗部 gamma、按通道黑/白场、温和 S 和 Lab 饱和度，再经目标 ICC 转回 CMYK。下载的 TIFF、网页预览、`test.py` 的 `.tif`/`.jpg` 都走同一结果。关掉用 `--no-de-gray`；强度用 `--de-gray-shadow-lift`（默认 0.3）和 `--de-gray-strength`（默认 0.6）。已生成的文件不会自动更新，需重启服务后重新跑图。
+
 ## 数据配对
 
 多项式、残差 LUT 和自适应 LUT 使用同一套图片对参数。下面示例用 `train.py`，把命令换成 `train_adaptive_lut.py` 或 `train_residual_lut.py` 即可（后两者还必须加 `--target-icc`）。
@@ -420,8 +422,8 @@ python3 test.py \
 仓库包含一个无需前端构建工具的本地 Web 系统，支持：
 
 - 批量上传 JPG、PNG、TIFF；
-- 后台并行调用模型，输出带目标 ICC 的 CMYK TIFF；
-- 为浏览器生成目标 ICC 下的 sRGB 预览；
+- 后台并行调用模型，输出带目标 ICC 的 CMYK TIFF（默认写入去灰：黑白场 + 温和 S + 饱和度）；
+- 为浏览器生成该输出的 sRGB 预览；
 - 原图/调色结果拖动对比；
 - 为每张结果上传像素对齐的 RGB/CMYK 目标图，并切换“原图/模型”或“目标图/模型”拖动对比；
 - 通过、驳回、审核备注和状态筛选；

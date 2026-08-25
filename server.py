@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from PIL import Image, ImageCms
 
-from color_model import load_color_model, render_cmyk_to_srgb
+from color_model import de_gray_cmyk, load_color_model, render_cmyk_to_srgb
 
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
@@ -48,6 +48,9 @@ class AppState:
         edge_lift: float | None = None,
         shadow_lift: float | None = None,
         device: str | None = "auto",
+        de_gray: bool = True,
+        de_gray_shadow_lift: float = 0.3,
+        de_gray_strength: float = 0.6,
     ):
         self.model = load_color_model(model_path, device=device)
         self.model_path = model_path
@@ -56,11 +59,27 @@ class AppState:
         self.max_upload_mb = max_upload_mb
         self.edge_lift = edge_lift
         self.shadow_lift = shadow_lift
+        self.de_gray = de_gray
+        self.de_gray_shadow_lift = de_gray_shadow_lift
+        self.de_gray_strength = de_gray_strength
         self.max_upload_bytes = max_upload_mb * 1024 * 1024
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.infer_lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="colour")
+
+    def render_preview(self, cmyk: Image.Image, icc: bytes | None = None) -> Image.Image:
+        return render_cmyk_to_srgb(cmyk, icc or self.model.target_icc)
+
+    def apply_de_gray(self, cmyk: Image.Image) -> Image.Image:
+        if not self.de_gray:
+            return cmyk
+        return de_gray_cmyk(
+            cmyk,
+            self.model.target_icc,
+            shadow_lift=self.de_gray_shadow_lift,
+            strength=self.de_gray_strength,
+        )
 
     def batch_dir(self, batch_id: str) -> Path:
         if not batch_id.replace("-", "").isalnum():
@@ -193,11 +212,13 @@ class AppState:
                         edge_lift=self.edge_lift,
                         shadow_lift=self.shadow_lift,
                     )
+            result = self.apply_de_gray(result)
             output_name = image_id + ".tif"
             preview_name = image_id + ".jpg"
             result.save(root / "output" / output_name, compression="tiff_lzw", icc_profile=self.model.target_icc)
-            preview = render_cmyk_to_srgb(result, self.model.target_icc)
-            preview.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
+            preview_src = result.copy()
+            preview_src.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
+            preview = self.render_preview(preview_src)
             preview.save(root / "preview" / preview_name, quality=91, optimize=True)
             self.update_item(
                 batch_id, image_id,
@@ -259,7 +280,7 @@ class AppState:
                 target.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
                 if target.mode == "CMYK":
                     icc = target.info.get("icc_profile") or self.model.target_icc
-                    preview = render_cmyk_to_srgb(target, icc)
+                    preview = self.render_preview(target, icc)
                 else:
                     icc = target.info.get("icc_profile")
                     if icc:
@@ -509,6 +530,18 @@ def main() -> None:
         "--device", default="auto",
         help="PyTorch device for .pt models: auto, cpu, mps, or cuda",
     )
+    p.add_argument(
+        "--de-gray", action=argparse.BooleanOptionalAction, default=True,
+        help="write shadow lift / S / saturation into the CMYK output (and matching preview)",
+    )
+    p.add_argument(
+        "--de-gray-shadow-lift", type=float, default=0.3,
+        help="output shadow lift 0..1; only used with --de-gray",
+    )
+    p.add_argument(
+        "--de-gray-strength", type=float, default=0.6,
+        help="output S-curve and saturation strength 0..1; only used with --de-gray",
+    )
     args = p.parse_args()
     if args.max_upload_mb <= 0:
         raise ValueError("--max-upload-mb must be greater than zero")
@@ -516,10 +549,17 @@ def main() -> None:
         raise ValueError("--edge-lift 不能为负数")
     if args.shadow_lift is not None and args.shadow_lift < 0:
         raise ValueError("--shadow-lift 不能为负数")
+    if not 0 <= args.de_gray_shadow_lift <= 1:
+        raise ValueError("--de-gray-shadow-lift 必须在 [0, 1] 范围")
+    if not 0 <= args.de_gray_strength <= 1:
+        raise ValueError("--de-gray-strength 必须在 [0, 1] 范围")
     app = AppState(
         Path(args.model), Path(args.data), args.workers,
         args.max_hue_shift, args.max_upload_mb, args.edge_lift, args.shadow_lift,
         device=args.device,
+        de_gray=args.de_gray,
+        de_gray_shadow_lift=args.de_gray_shadow_lift,
+        de_gray_strength=args.de_gray_strength,
     )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.app = app  # type: ignore[attr-defined]
@@ -530,6 +570,13 @@ def main() -> None:
         print(f"Edge lift: {args.edge_lift:g}")
     if args.shadow_lift is not None:
         print(f"Shadow lift: {args.shadow_lift:g}")
+    if app.de_gray:
+        print(
+            f"Output de-gray: shadow_lift={app.de_gray_shadow_lift:g} "
+            f"strength={app.de_gray_strength:g}"
+        )
+    else:
+        print("Output de-gray: off")
     try:
         server.serve_forever()
     except KeyboardInterrupt:

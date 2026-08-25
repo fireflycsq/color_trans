@@ -9,7 +9,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from color_model import image_to_srgb, load_color_model, render_cmyk_to_srgb, srgb_to_lab
+from color_model import (
+    de_gray_cmyk,
+    image_to_srgb,
+    load_color_model,
+    render_cmyk_to_srgb,
+    srgb_to_lab,
+)
 from residual_lut_model import ResidualLUTModel, edge_lift_amounts, shadow_lift_amounts
 from adaptive_lut_model import AdaptiveLUTModel
 from portrait_mask import portrait_mask, portrait_region_from_metadata
@@ -57,20 +63,41 @@ def main() -> None:
         "--device", default="auto",
         help="PyTorch device for .pt models: auto, cpu, mps, or cuda",
     )
+    p.add_argument(
+        "--de-gray", action=argparse.BooleanOptionalAction, default=True,
+        help="write shadow lift / S / saturation into the saved CMYK or JPEG",
+    )
+    p.add_argument("--de-gray-shadow-lift", type=float, default=0.3)
+    p.add_argument("--de-gray-strength", type=float, default=0.6)
     args = p.parse_args()
     if args.edge_lift is not None and args.edge_lift < 0:
         raise ValueError("--edge-lift 不能为负数")
     if args.shadow_lift is not None and args.shadow_lift < 0:
         raise ValueError("--shadow-lift 不能为负数")
+    if not 0 <= args.de_gray_shadow_lift <= 1:
+        raise ValueError("--de-gray-shadow-lift 必须在 [0, 1] 范围")
+    if not 0 <= args.de_gray_strength <= 1:
+        raise ValueError("--de-gray-strength 必须在 [0, 1] 范围")
 
     model = load_color_model(args.model, device=args.device)
     src = Image.open(args.input)
     pred = model.predict_image(src, edge_lift=args.edge_lift, shadow_lift=args.shadow_lift)
     out = Path(args.output)
-    save_args = {"icc_profile": model.target_icc}
-    if out.suffix.lower() in {".jpg", ".jpeg"}:
-        save_args.update(quality=args.quality, subsampling=0)
-    pred.save(out, **save_args)
+    is_jpeg = out.suffix.lower() in {".jpg", ".jpeg"}
+    if args.de_gray:
+        pred = de_gray_cmyk(
+            pred, model.target_icc,
+            shadow_lift=args.de_gray_shadow_lift,
+            strength=args.de_gray_strength,
+        )
+    if is_jpeg:
+        preview = render_cmyk_to_srgb(pred, model.target_icc)
+        preview.save(out, quality=args.quality, subsampling=0, optimize=True)
+        saved_mode = preview.mode
+    else:
+        pred.save(out, icc_profile=model.target_icc)
+        saved_mode = pred.mode
+    de_gray_note = "de-gray on" if args.de_gray else "de-gray off"
     extras = []
     if isinstance(model, AdaptiveLUTModel):
         extras.append("adaptive CMYK LUT")
@@ -89,7 +116,10 @@ def main() -> None:
     device_note = ""
     if isinstance(model, AdaptiveLUTModel):
         device_note = f", device={model.device}"
-    print(f"saved: {out.resolve()} ({pred.mode}, embedded {model.metadata['target_profile']}{extra}{device_note})")
+    print(
+        f"saved: {out.resolve()} ({saved_mode}, {de_gray_note}, "
+        f"{model.metadata['target_profile']}{extra}{device_note})"
+    )
     if args.save_portrait_mask:
         region = portrait_region_from_metadata(getattr(model, "metadata", {}))
         mask = portrait_mask(np.asarray(image_to_srgb(src), dtype=np.uint8), region=region)
