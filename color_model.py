@@ -133,19 +133,31 @@ def _apply_transform_rows(image: Image.Image, transform, chunk_rows: int) -> Ima
     return Image.fromarray(np.concatenate(parts, axis=0), mode)
 
 
+def _soft_highlights(img_f, start: float = 0.78, ceiling: float = 0.94):
+    """Roll values above ``start`` (including >1) into [start, ceiling]."""
+    img_f = np.maximum(img_f, 0.0)
+    above = np.maximum(img_f - start, 0.0)
+    room = max(ceiling - start, 1e-6)
+    rolled = start + room * (above / (above + 0.50))
+    return np.where(img_f > start, np.minimum(rolled, ceiling), img_f)
+
+
 def avoid_washout_adjust(
     image: Image.Image,
-    shadow_lift: float = 0.25,
+    shadow_lift: float = 0.18,
     strength: float = 0.6,
     black_pct: float = 1.0,
     white_pct: float = 99.0,
     black_max: float = 0.18,
+    highlight_ceiling: float = 0.94,
+    cool: float = 0.55,
 ) -> Image.Image:
-    """Match a punchy human grade: crush gray fog, then brighten mids/highlights.
+    """Crush gray fog and lift mids, without blowing stage highlights.
 
-    The model CMYK is often underexposed versus the target. White is stretched
-    to the actual highlight percentile (not clamped to 0.90, which kept dark
-    frames dark). Midtone gamma runs after the black crush so 0 stays 0.
+    99th-percentile stretch used to hard-clip the brightest 1% to 1.0 (hands,
+    white fabric). Those values are kept above 1 and soft-rolled at the end.
+    ``cool`` pulls midtone Lab yellow/orange toward pale cyan-gray so a golden
+    model grade can match a cooler human target.
     """
     rgb = image.convert("RGB")
     img_f = np.asarray(rgb, dtype=np.float32) / 255.0
@@ -160,7 +172,9 @@ def avoid_washout_adjust(
     white_point = float(np.percentile(luma, white_pct))
     white_point = min(max(white_point, black_point + 0.20), 1.0)
     img_f = (img_f - black_point) / (white_point - black_point + 1e-6)
-    img_f = np.clip(img_f, 0.0, 1.0)
+    img_f = np.maximum(img_f, 0.0)
+    over = np.maximum(img_f - 1.0, 0.0)
+    img_f = np.minimum(img_f, 1.0)
 
     if shadow_lift > 0:
         gamma = 1.0 - np.clip(shadow_lift, 0.0, 1.0) * 0.35
@@ -175,13 +189,25 @@ def avoid_washout_adjust(
         img_f = (1.0 - s_strength) * img_f + s_strength * s_curved
         img_f = np.clip(img_f, 0.0, 1.0)
 
-    if strength > 0:
+    img_f = _soft_highlights(img_f + over, ceiling=highlight_ceiling)
+    img_f = np.clip(img_f, 0.0, 1.0)
+
+    if strength > 0 or cool > 0:
         sat_gain = 1.0 + np.clip(strength, 0.0, 1.0) * 0.22
+        cool_amt = np.clip(cool, 0.0, 1.0)
         rows = []
         chunk = 256
         for y in range(0, img_f.shape[0], chunk):
             lab = srgb_to_lab(img_f[y:y + chunk])
-            lab[..., 1:] *= sat_gain
+            if strength > 0:
+                lab[..., 1:] *= sat_gain
+            if cool_amt > 0:
+                L = lab[..., 0]
+                gate = np.clip((L - 32.0) / 36.0, 0.0, 1.0) * np.clip((98.0 - L) / 28.0, 0.0, 1.0)
+                gate = gate[..., None]
+                lab[..., 1:2] = lab[..., 1:2] - 5.0 * cool_amt * gate
+                lab[..., 2:3] = lab[..., 2:3] - 16.0 * cool_amt * gate
+                lab[..., 1:] *= 1.0 - 0.10 * cool_amt * gate
             rows.append(lab_to_srgb(lab).astype(np.float32))
         img_f = np.concatenate(rows, axis=0)
 
@@ -192,10 +218,12 @@ def avoid_washout_adjust(
 def de_gray_cmyk(
     image: Image.Image,
     icc: bytes,
-    shadow_lift: float = 0.25,
+    shadow_lift: float = 0.18,
     strength: float = 0.6,
     black_pct: float = 1.0,
     white_pct: float = 99.0,
+    highlight_ceiling: float = 0.94,
+    cool: float = 0.55,
 ) -> Image.Image:
     """Apply washout correction in sRGB and write it back to target CMYK."""
     rgb = render_cmyk_to_srgb(image, icc)
@@ -205,6 +233,8 @@ def de_gray_cmyk(
         strength=strength,
         black_pct=black_pct,
         white_pct=white_pct,
+        highlight_ceiling=highlight_ceiling,
+        cool=cool,
     )
     return srgb_to_cmyk(rgb, icc)
 
@@ -213,10 +243,12 @@ def render_cmyk_preview(
     image: Image.Image,
     icc: bytes,
     de_gray: bool = False,
-    shadow_lift: float = 0.25,
+    shadow_lift: float = 0.18,
     strength: float = 0.6,
     black_pct: float = 1.0,
     white_pct: float = 99.0,
+    highlight_ceiling: float = 0.94,
+    cool: float = 0.55,
 ) -> Image.Image:
     """ICC-render CMYK to sRGB. Optional extra de-gray if the CMYK is not already adjusted."""
     preview = render_cmyk_to_srgb(image, icc)
@@ -228,6 +260,8 @@ def render_cmyk_preview(
         strength=strength,
         black_pct=black_pct,
         white_pct=white_pct,
+        highlight_ceiling=highlight_ceiling,
+        cool=cool,
     )
 
 

@@ -68,10 +68,18 @@ def main() -> None:
         help="write black crush / S / saturation into the saved CMYK or JPEG",
     )
     p.add_argument(
-        "--de-gray-shadow-lift", type=float, default=0.25,
+        "--de-gray-shadow-lift", type=float, default=0.18,
         help="midtone lift 0..1 after black crush; brightens without lifting crushed blacks",
     )
     p.add_argument("--de-gray-strength", type=float, default=0.6)
+    p.add_argument(
+        "--de-gray-highlight-ceiling", type=float, default=0.94,
+        help="soft-roll highlights to this 0..1 ceiling so hands/white fabric do not clip",
+    )
+    p.add_argument(
+        "--de-gray-cool", type=float, default=0.55,
+        help="pull midtone yellow/orange toward pale cyan-gray 0..1",
+    )
     args = p.parse_args()
     if args.edge_lift is not None and args.edge_lift < 0:
         raise ValueError("--edge-lift 不能为负数")
@@ -81,6 +89,10 @@ def main() -> None:
         raise ValueError("--de-gray-shadow-lift 必须在 [0, 1] 范围")
     if not 0 <= args.de_gray_strength <= 1:
         raise ValueError("--de-gray-strength 必须在 [0, 1] 范围")
+    if not 0.5 <= args.de_gray_highlight_ceiling <= 1:
+        raise ValueError("--de-gray-highlight-ceiling 必须在 [0.5, 1] 范围")
+    if not 0 <= args.de_gray_cool <= 1:
+        raise ValueError("--de-gray-cool 必须在 [0, 1] 范围")
 
     model = load_color_model(args.model, device=args.device)
     src = Image.open(args.input)
@@ -92,6 +104,8 @@ def main() -> None:
             pred, model.target_icc,
             shadow_lift=args.de_gray_shadow_lift,
             strength=args.de_gray_strength,
+            highlight_ceiling=args.de_gray_highlight_ceiling,
+            cool=args.de_gray_cool,
         )
     if is_jpeg:
         preview = render_cmyk_to_srgb(pred, model.target_icc)

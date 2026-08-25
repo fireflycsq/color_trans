@@ -49,8 +49,10 @@ class AppState:
         shadow_lift: float | None = None,
         device: str | None = "auto",
         de_gray: bool = True,
-        de_gray_shadow_lift: float = 0.25,
+        de_gray_shadow_lift: float = 0.18,
         de_gray_strength: float = 0.6,
+        de_gray_highlight_ceiling: float = 0.94,
+        de_gray_cool: float = 0.55,
     ):
         self.model = load_color_model(model_path, device=device)
         self.model_path = model_path
@@ -62,6 +64,8 @@ class AppState:
         self.de_gray = de_gray
         self.de_gray_shadow_lift = de_gray_shadow_lift
         self.de_gray_strength = de_gray_strength
+        self.de_gray_highlight_ceiling = de_gray_highlight_ceiling
+        self.de_gray_cool = de_gray_cool
         self.max_upload_bytes = max_upload_mb * 1024 * 1024
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -79,6 +83,8 @@ class AppState:
             self.model.target_icc,
             shadow_lift=self.de_gray_shadow_lift,
             strength=self.de_gray_strength,
+            highlight_ceiling=self.de_gray_highlight_ceiling,
+            cool=self.de_gray_cool,
         )
 
     def batch_dir(self, batch_id: str) -> Path:
@@ -535,12 +541,20 @@ def main() -> None:
         help="write black crush / S / saturation into the CMYK output (and matching preview)",
     )
     p.add_argument(
-        "--de-gray-shadow-lift", type=float, default=0.25,
+        "--de-gray-shadow-lift", type=float, default=0.18,
         help="midtone lift 0..1 after black crush; brightens without lifting crushed blacks",
     )
     p.add_argument(
         "--de-gray-strength", type=float, default=0.6,
         help="output S-curve and saturation strength 0..1; only used with --de-gray",
+    )
+    p.add_argument(
+        "--de-gray-highlight-ceiling", type=float, default=0.94,
+        help="soft-roll highlights to this 0..1 ceiling so hands/white fabric do not clip",
+    )
+    p.add_argument(
+        "--de-gray-cool", type=float, default=0.55,
+        help="pull midtone yellow/orange toward pale cyan-gray 0..1",
     )
     args = p.parse_args()
     if args.max_upload_mb <= 0:
@@ -553,6 +567,10 @@ def main() -> None:
         raise ValueError("--de-gray-shadow-lift 必须在 [0, 1] 范围")
     if not 0 <= args.de_gray_strength <= 1:
         raise ValueError("--de-gray-strength 必须在 [0, 1] 范围")
+    if not 0.5 <= args.de_gray_highlight_ceiling <= 1:
+        raise ValueError("--de-gray-highlight-ceiling 必须在 [0.5, 1] 范围")
+    if not 0 <= args.de_gray_cool <= 1:
+        raise ValueError("--de-gray-cool 必须在 [0, 1] 范围")
     app = AppState(
         Path(args.model), Path(args.data), args.workers,
         args.max_hue_shift, args.max_upload_mb, args.edge_lift, args.shadow_lift,
@@ -560,6 +578,8 @@ def main() -> None:
         de_gray=args.de_gray,
         de_gray_shadow_lift=args.de_gray_shadow_lift,
         de_gray_strength=args.de_gray_strength,
+        de_gray_highlight_ceiling=args.de_gray_highlight_ceiling,
+        de_gray_cool=args.de_gray_cool,
     )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.app = app  # type: ignore[attr-defined]
@@ -573,7 +593,9 @@ def main() -> None:
     if app.de_gray:
         print(
             f"Output de-gray: shadow_lift={app.de_gray_shadow_lift:g} "
-            f"strength={app.de_gray_strength:g}"
+            f"strength={app.de_gray_strength:g} "
+            f"highlight_ceiling={app.de_gray_highlight_ceiling:g} "
+            f"cool={app.de_gray_cool:g}"
         )
     else:
         print("Output de-gray: off")
