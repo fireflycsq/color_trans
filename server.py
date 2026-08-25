@@ -76,6 +76,8 @@ class AppState:
         return render_cmyk_to_srgb(cmyk, icc or self.model.target_icc)
 
     def apply_de_gray(self, cmyk: Image.Image) -> Image.Image:
+        if getattr(self.model, "has_look", False):
+            return cmyk
         if not self.de_gray:
             return cmyk
         return de_gray_cmyk(
@@ -590,7 +592,9 @@ def main() -> None:
         print(f"Edge lift: {args.edge_lift:g}")
     if args.shadow_lift is not None:
         print(f"Shadow lift: {args.shadow_lift:g}")
-    if app.de_gray:
+    if getattr(app.model, "has_look", False):
+        print("Output look: baked into adaptive v3 model (CLI --de-gray skipped)")
+    elif app.de_gray:
         print(
             f"Output de-gray: shadow_lift={app.de_gray_shadow_lift:g} "
             f"strength={app.de_gray_strength:g} "

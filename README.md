@@ -7,17 +7,19 @@
 ```text
 Input RGB
     ├─ ICC ──────────────────────────────────────► CMYK 基线
-    ├─ Global Encoder (Small CNN)
-    │     ├─ 1D luma S-curve（反差/密度）
-    │     └─ 17³×4 偏色残差 + Confidence
-    └─ MediaPipe Person/Skin → Crop → Portrait Encoder（同样 1D + 3D）
+    ├─ Thumbnail stats（亮度直方图 / 黑白点）
+    ├─ Global Encoder (Small CNN + stats)
+    │     ├─ 1D 相对亮度 S 曲线（反差/密度）
+    │     ├─ 17³×4 偏色残差 + Confidence
+    │     └─ look：黑白拉伸、中间调、S、高光软压、去金黄
+    └─ MediaPipe Person/Skin → Crop → Portrait Encoder（同样结构）
          ↓
-    CMYK = ICC + 1D_S(luma) + gate × (3D − mean) + 遮罩 × 人像同结构
+    CMYK = ICC + 1D_S(相对 luma) + gate × (3D − mean) + look(CMYK) + 遮罩 × 人像
          ↓
     edge-lift → Final CMYK
 ```
 
-全图 CNN 看 256×256 缩略图。一条按亮度 `0.299R+0.587G+0.114B` 查的 1 维 S 曲线管反差和密度；17³×4 残差对 CMYK 做均值中心化，只学偏色，不能再偷走 S。人像分支用 MediaPipe 抠人（或皮肤），裁切后再编码第二套 1D+3D，只在遮罩内叠到全局结果上。ICC 只做固定基线、不反传。训练损失直接对人工 CMYK target，暗部和高光比中间调权重大（`--luma-weight`）。已有 `adaptive_cmyk_lut_v1` / `adaptive_rgb_lut_v1` 的 `.pt` **不能**接着用这条拆分，必须从 `--stage global` 重训。v1 仍可加载推理（不拆 S、3D 不去均值）。
+全图 CNN 看 256×256 缩略图，并读入该缩略图的亮度直方图与黑白点，这样夜景灰雾和舞台高光不会共用同一条绝对亮度曲线。1D 按本图拉伸后的相对亮度查表；17³×4 残差仍对 CMYK 均值中心化，只学偏色。look 头把去灰（百分位拉伸、中间调、S、高光 roll、Lab 去黄）写进前向，训练时与 LUT 一起反传。人像分支用 MediaPipe 抠人（或皮肤），裁切后再编码第二套 1D+3D+look，只在遮罩内叠到全局结果上。ICC 只做固定基线、不反传。损失是人工 CMYK 的 Huber，加上 naive RGB→Lab 外观项（`--appearance-weight`），可选再对 ICC 预览做 look 损失（`--icc-look-weight`）。已有 `adaptive_cmyk_lut_v2` / `v1` / `adaptive_rgb_lut_v1` 的 `.pt` **不能**接着用这条结构，必须从 `--stage global` 重训。v1/v2 仍可加载推理。
 
 需要 PyTorch：
 
@@ -48,6 +50,9 @@ python3 train_adaptive_lut.py \
   --max-eval-samples 250000 \
   --huber-delta 0.125 \
   --luma-weight 1.0 \
+  --cmyk-weight 1.0 \
+  --appearance-weight 1.0 \
+  --icc-look-weight 0.35 \
   --lut-l1 0.01 \
   --smoothness 0.03 \
   --tone-bins 17 \
@@ -96,7 +101,7 @@ Mac 上整图 LUT 插值在 CPU 上（比原先 numpy 查表快，也比 MPS 扫
 
 `--edge-lift` 仍作用在最终 CMYK 上（默认轮廓减 K）。新训的模型默认**关掉** `--shadow-lift`，以免把调图师压暗的阴影再提亮；需要暗部减墨时再显式传入，例如 `--shadow-lift 0.06`。旧的 `.npz` 若元数据里仍写着 0.06，行为不变。
 
-默认还会把**去灰写进最终输出**：按亮度压灰雾、拉开中间调、温和 S；中间调默认 `--de-gray-cool 0.55` 把模型的软金黄往目标的发白发青灰拉（减 Lab 黄/橙）。高光软压缩到 0.94。关掉用 `--no-de-gray`。金黄还在可把 cool 加到 `0.75`；已经偏青则降到 `0.3`。已生成的文件不会自动更新，需重启服务后重新跑图。
+v3 模型把去灰写进网络前向（look 头，随每张图的直方图变化）。`test.py` / `server.py` 对 v3 **不再叠加**原来的固定 `--de-gray`。v1/v2 仍默认走后处理去灰：按亮度压灰雾、拉开中间调、温和 S；中间调默认 `--de-gray-cool 0.55`。关掉用 `--no-de-gray`。已生成的文件不会自动更新，需用 v3 重训后的 `.pt` 重新跑图。
 
 ## 数据配对
 
@@ -422,7 +427,7 @@ python3 test.py \
 仓库包含一个无需前端构建工具的本地 Web 系统，支持：
 
 - 批量上传 JPG、PNG、TIFF；
-- 后台并行调用模型，输出带目标 ICC 的 CMYK TIFF（默认写入去灰：压黑场 + 温和 S + 饱和度）；
+- 后台并行调用模型，输出带目标 ICC 的 CMYK TIFF（v3 的 look 已写进模型；v1/v2 仍默认后处理去灰）；
 - 为浏览器生成该输出的 sRGB 预览；
 - 原图/调色结果拖动对比；
 - 为每张结果上传像素对齐的 RGB/CMYK 目标图，并切换“原图/模型”或“目标图/模型”拖动对比；

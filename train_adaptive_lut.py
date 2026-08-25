@@ -3,8 +3,9 @@
 
 Stage ``global`` trains a small CNN on the full frame. Stage ``portrait``
 freezes that encoder and trains a second CNN on a MediaPipe person/skin crop.
-The CNN emits a 1D luma S-curve plus a mean-centred 17³×4 hue residual;
-loss is Huber against the human CMYK target.
+v3 emits histogram-conditioned 1D relative-luma tone, a mean-centred 17³×4
+hue residual, and a look head (stretch / midtone / S / cool) baked into CMYK.
+Loss is Huber on CMYK plus Lab appearance vs the human target.
 """
 
 from __future__ import annotations
@@ -19,15 +20,24 @@ import numpy as np
 from PIL import Image, ImageCms
 
 from adaptive_lut_model import (
+    LOOK_DIM,
+    MODEL_TYPE,
+    STAT_DIM,
     THUMBNAIL,
     AdaptiveLUTModel,
-    MODEL_TYPE,
-    SmallLutEncoder,
+    appearance_loss,
+    apply_look_cmyk_torch,
     apply_lut_torch,
+    apply_washout_torch,
+    create_adaptive_encoder,
+    image_stats_tensor,
     image_to_tensor,
     lut_smoothness,
+    naive_cmyk_to_rgb,
     numpy_to_torch,
+    relative_luma,
     resolve_device,
+    stats_black_white,
     tone_smoothness,
     unpack_encoder_out,
 )
@@ -39,6 +49,7 @@ from train import (
     icc_status_counts,
     load_fixed_target_icc,
     profile_details,
+    render_samples,
     sample_budget,
     stratified_indices,
     validate_pairs,
@@ -96,20 +107,29 @@ def sample_pixels(
     return rgb, baseline, target, idx
 
 
-def encode_full(encoder, image: Image.Image, device, size: int | None = None):
+def encode_full(encoder, image: Image.Image, device, stats=None, size: int | None = None):
     if size is not None and image.size != (size, size):
         image = image.resize((size, size), Image.Resampling.BILINEAR)
-    return encoder(image_to_tensor(image, device))
+    if stats is None and getattr(encoder, "stat_proj", None) is not None:
+        stats = image_stats_tensor(image, device)
+    return encoder(image_to_tensor(image, device), stats)
 
 
-def apply_split(out, rgb, baseline):
-    lut, conf, tone = unpack_encoder_out(out)
+def apply_split(out, rgb, baseline, stats=None, relative_tone: bool = True, apply_look: bool = True):
+    lut, conf, tone, look = unpack_encoder_out(out)
+    black, white = stats_black_white(stats)
+    tone_coord = relative_luma(rgb, black, white) if relative_tone else None
     pred = apply_lut_torch(
         rgb, baseline, lut[0], conf[0],
         None if tone is None else tone[0],
         chroma_only=True,
+        tone_coord=tone_coord,
     )
-    return pred, lut, tone
+    if apply_look and look is not None:
+        black_t = pred.new_tensor(float(black) if not hasattr(black, "item") else float(black.item()))
+        white_t = pred.new_tensor(float(white) if not hasattr(white, "item") else float(white.item()))
+        pred = apply_look_cmyk_torch(pred, look[0], black_t, white_t)
+    return pred, lut, tone, look
 
 
 def luma_pixel_weight(rgb, strength: float):
@@ -124,7 +144,7 @@ def luma_pixel_weight(rgb, strength: float):
 
 def train_epoch(
     encoder, optimizer, pairs: list[Pair], transform, args, device, seed: int,
-    global_encoder=None, region: str = "person",
+    icc: bytes, global_encoder=None, region: str = "person",
 ) -> float:
     torch, F = _torch()
     encoder.train()
@@ -133,6 +153,7 @@ def train_epoch(
     total = 0.0
     steps = 0
     budget = sample_budget(len(pairs), args.samples_per_image, args.max_samples)
+    relative_tone = not args.absolute_tone
     for i, pair in enumerate(pairs, 1):
         with Image.open(pair.source) as preview:
             width, height = preview.size
@@ -147,9 +168,14 @@ def train_epoch(
         rgb_t = numpy_to_torch(rgb, device)
         base_t = numpy_to_torch(baseline, device)
         target_t = numpy_to_torch(target, device)
+        thumb_stats = image_stats_tensor(thumb, device)
         rgb_loss = rgb_t
+        look_pred = None
         if global_encoder is None:
-            pred, lut, tone = apply_split(encode_full(encoder, thumb, device), rgb_t, base_t)
+            pred, lut, tone, look_pred = apply_split(
+                encode_full(encoder, thumb, device, thumb_stats),
+                rgb_t, base_t, thumb_stats, relative_tone,
+            )
         else:
             mask_img = portrait_mask(rgb_u8, region=region)
             crop = portrait_crop(rgb_u8, mask_img, args.thumbnail, args.mask_threshold)
@@ -158,12 +184,15 @@ def train_epoch(
                 print(f"[train {i:>4}/{len(pairs)}] {pair.name}: no {region} crop", flush=True)
                 continue
             crop = apply_embedded_srgb(crop, src_icc)
+            crop_stats = image_stats_tensor(crop, device)
             with torch.no_grad():
-                base, _, _ = apply_split(
-                    encode_full(global_encoder, thumb, device), rgb_t, base_t,
+                base, _, _, _ = apply_split(
+                    encode_full(global_encoder, thumb, device, thumb_stats),
+                    rgb_t, base_t, thumb_stats, relative_tone,
                 )
-            portrait, lut, tone = apply_split(
-                encoder(image_to_tensor(crop, device)), rgb_t, base,
+            portrait, lut, tone, look_pred = apply_split(
+                encode_full(encoder, crop, device, crop_stats),
+                rgb_t, base, crop_stats, relative_tone,
             )
             gate = numpy_to_torch(mask.astype(np.float32), device).unsqueeze(-1)
             pred = (1.0 - gate) * base + gate * portrait
@@ -175,9 +204,27 @@ def train_epoch(
             pred = pred[keep_t]
             target_t = target_t[keep_t]
             rgb_loss = rgb_t[keep_t]
+            baseline = baseline[keep]
+            target = target[keep]
         huber = F.huber_loss(pred, target_t, delta=args.huber_delta, reduction="none")
         weight = luma_pixel_weight(rgb_loss, args.luma_weight)
-        loss = (huber.mean(dim=-1) * weight).sum() / weight.sum().clamp_min(1e-6)
+        cmyk_loss = (huber.mean(dim=-1) * weight).sum() / weight.sum().clamp_min(1e-6)
+        loss = args.cmyk_weight * cmyk_loss
+        if args.appearance_weight > 0:
+            loss = loss + args.appearance_weight * appearance_loss(
+                naive_cmyk_to_rgb(pred), naive_cmyk_to_rgb(target_t), F.huber_loss,
+                delta=args.appearance_delta,
+            )
+        if args.icc_look_weight > 0 and look_pred is not None:
+            base_srgb = numpy_to_torch(render_samples(baseline, icc), device)
+            target_srgb = numpy_to_torch(render_samples(target, icc), device)
+            black, white = stats_black_white(thumb_stats if global_encoder is None else crop_stats)
+            black_t = pred.new_tensor(float(black) if not hasattr(black, "item") else float(black.item()))
+            white_t = pred.new_tensor(float(white) if not hasattr(white, "item") else float(white.item()))
+            looked = apply_washout_torch(base_srgb, black_t, white_t, look_pred[0])
+            loss = loss + args.icc_look_weight * appearance_loss(
+                looked, target_srgb, F.huber_loss, delta=args.appearance_delta,
+            )
         loss = loss + args.lut_l1 * lut[0].abs().mean() + args.smoothness * lut_smoothness(lut[0])
         if tone is not None:
             loss = loss + args.tone_smoothness * tone_smoothness(tone[0])
@@ -187,7 +234,8 @@ def train_epoch(
         total += float(loss.item())
         steps += 1
         print(
-            f"[train {i:>4}/{len(pairs)}] {pair.name}: loss={loss.item():.5f} pixels={pred.shape[0]:,}",
+            f"[train {i:>4}/{len(pairs)}] {pair.name}: loss={loss.item():.5f} "
+            f"cmyk={float(cmyk_loss.item()):.5f} pixels={pred.shape[0]:,}",
             flush=True,
         )
     if steps == 0:
@@ -278,6 +326,26 @@ def parse_args() -> argparse.Namespace:
         "--luma-weight", type=float, default=1.0,
         help="extra Huber weight at shadows/highlights vs midtones; 0 disables",
     )
+    p.add_argument(
+        "--cmyk-weight", type=float, default=1.0,
+        help="weight on CMYK Huber vs the human target",
+    )
+    p.add_argument(
+        "--appearance-weight", type=float, default=1.0,
+        help="weight on Lab Huber of naive RGB(pred) vs RGB(target); 0 disables",
+    )
+    p.add_argument(
+        "--appearance-delta", type=float, default=0.08,
+        help="Huber delta in scaled Lab (L/50, a/25, b/25)",
+    )
+    p.add_argument(
+        "--icc-look-weight", type=float, default=0.35,
+        help="extra Lab loss: look(ICC baseline sRGB) vs target sRGB; 0 disables",
+    )
+    p.add_argument(
+        "--absolute-tone", action="store_true",
+        help="1D curve keyed by absolute luma (v2); default is histogram-relative",
+    )
     p.add_argument("--lut-l1", type=float, default=0.01)
     p.add_argument("--smoothness", type=float, default=0.03)
     p.add_argument("--tone-bins", type=int, default=17)
@@ -306,6 +374,14 @@ def main() -> None:
         raise ValueError("--tone-smoothness 不能为负数")
     if args.luma_weight < 0:
         raise ValueError("--luma-weight 不能为负数")
+    if args.cmyk_weight < 0:
+        raise ValueError("--cmyk-weight 不能为负数")
+    if args.appearance_weight < 0:
+        raise ValueError("--appearance-weight 不能为负数")
+    if args.icc_look_weight < 0:
+        raise ValueError("--icc-look-weight 不能为负数")
+    if args.appearance_delta <= 0:
+        raise ValueError("--appearance-delta 必须为正数")
     device = resolve_device(args.device)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -322,21 +398,25 @@ def main() -> None:
 
     loaded = None
     if args.stage == "global":
-        encoder = SmallLutEncoder.create(args.grid_size, args.channels, args.tone_bins).to(device)
+        encoder = create_adaptive_encoder(
+            args.grid_size, args.channels, args.tone_bins, version=MODEL_TYPE,
+        ).to(device)
         global_encoder = None
         region = "person"
     else:
         loaded = AdaptiveLUTModel.load(args.model, device=str(device))
-        if not loaded.tone_split:
+        if not loaded.has_look:
             raise ValueError(
-                "人像阶段需要 adaptive_cmyk_lut_v2（1D S + 3D 偏色）。请先重训 --stage global"
+                "人像阶段需要 adaptive_cmyk_lut_v3（直方图 + 相对 1D + look）。请先重训 --stage global"
             )
         args.grid_size = int(loaded.metadata.get("grid_size", args.grid_size))
         args.channels = int(loaded.metadata.get("encoder_channels", args.channels))
         args.thumbnail = int(loaded.metadata.get("thumbnail", args.thumbnail))
         args.tone_bins = int(loaded.metadata.get("tone_bins", args.tone_bins))
         global_encoder = loaded.global_encoder
-        encoder = SmallLutEncoder.create(args.grid_size, args.channels, args.tone_bins).to(device)
+        encoder = create_adaptive_encoder(
+            args.grid_size, args.channels, args.tone_bins, version=MODEL_TYPE,
+        ).to(device)
         if args.region == "person":
             require_person_segmenter()
         region = args.region
@@ -347,15 +427,17 @@ def main() -> None:
     optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
     history = []
     print(
-        f"objective: adaptive CMYK | stage={args.stage} | "
-        f"1D tone={args.tone_bins} + lut={args.grid_size}³×4 chroma | "
-        f"huber={args.huber_delta:g} | luma-weight={args.luma_weight:g}"
+        f"objective: adaptive CMYK v3 | stage={args.stage} | "
+        f"hist+rel-1D={args.tone_bins} + lut={args.grid_size}³×4 chroma + look | "
+        f"huber={args.huber_delta:g} | luma-weight={args.luma_weight:g} | "
+        f"cmyk={args.cmyk_weight:g} appearance={args.appearance_weight:g} "
+        f"icc-look={args.icc_look_weight:g}"
     )
     for epoch in range(1, args.epochs + 1):
         print(f"epoch {epoch}/{args.epochs} stage={args.stage}")
         mean_loss = train_epoch(
             encoder, optimizer, train_pairs, transform, args, device,
-            args.seed + epoch * 17, global_encoder, region,
+            args.seed + epoch * 17, icc, global_encoder, region,
         )
         print(f"epoch {epoch} mean loss={mean_loss:.5f}")
         history.append({"epoch": epoch, "train_loss": mean_loss})
@@ -371,6 +453,10 @@ def main() -> None:
         **(loaded.metadata if loaded is not None else {}),
         "model_type": MODEL_TYPE,
         "tone_split": True,
+        "look_head": True,
+        "relative_tone": not args.absolute_tone,
+        "stat_dim": STAT_DIM,
+        "look_dim": LOOK_DIM,
         "tone_bins": args.tone_bins,
         "stage": args.stage,
         "grid_size": args.grid_size,
@@ -381,6 +467,10 @@ def main() -> None:
         "lr": args.lr,
         "huber_delta_cmyk": args.huber_delta,
         "luma_weight": args.luma_weight,
+        "cmyk_weight": args.cmyk_weight,
+        "appearance_weight": args.appearance_weight,
+        "appearance_delta": args.appearance_delta,
+        "icc_look_weight": args.icc_look_weight,
         "lut_l1": args.lut_l1,
         "smoothness": args.smoothness,
         "tone_smoothness": args.tone_smoothness,

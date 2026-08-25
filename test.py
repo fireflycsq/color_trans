@@ -99,7 +99,8 @@ def main() -> None:
     pred = model.predict_image(src, edge_lift=args.edge_lift, shadow_lift=args.shadow_lift)
     out = Path(args.output)
     is_jpeg = out.suffix.lower() in {".jpg", ".jpeg"}
-    if args.de_gray:
+    baked_look = bool(getattr(model, "has_look", False))
+    if args.de_gray and not baked_look:
         pred = de_gray_cmyk(
             pred, model.target_icc,
             shadow_lift=args.de_gray_shadow_lift,
@@ -114,7 +115,9 @@ def main() -> None:
     else:
         pred.save(out, icc_profile=model.target_icc)
         saved_mode = pred.mode
-    de_gray_note = "de-gray on" if args.de_gray else "de-gray off"
+    de_gray_note = (
+        "v3 look baked" if baked_look else ("de-gray on" if args.de_gray else "de-gray off")
+    )
     extras = []
     if isinstance(model, AdaptiveLUTModel):
         extras.append("adaptive CMYK LUT")
