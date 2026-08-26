@@ -15,8 +15,6 @@ Input RGB
     └─ MediaPipe Person/Skin → Crop → Portrait Encoder（同样结构）
          ↓
     CMYK = ICC + 1D_S(相对 luma) + gate × (3D − mean) + look(CMYK) + 遮罩 × 人像
-         ↓
-    edge-lift → Final CMYK
 ```
 
 全图 CNN 看 256×256 缩略图，并读入该缩略图的亮度直方图与黑白点，这样夜景灰雾和舞台高光不会共用同一条绝对亮度曲线。1D 按本图拉伸后的相对亮度查表；17³×4 残差仍对 CMYK 均值中心化，只学偏色。look 头默认从接近恒等映射起步（拉伸/S/去黄都是学出来的混合量，不是一上来就满血去灰）。人像分支用 MediaPipe 抠人（或皮肤），裁切后再编码第二套 1D+3D+look，只在遮罩内叠到全局结果上。ICC 只做固定基线、不反传。损失是人工 CMYK 的 Huber，加上 naive RGB→Lab 外观项（`--appearance-weight`）。`--icc-look-weight` 默认 0：打开会逼 look 去拟合 ICC 预览差，容易把印刷 CMYK 拉离 target、val ΔE 差过纯 ICC。已有 `adaptive_cmyk_lut_v2` / `v1` / `adaptive_rgb_lut_v1` 的 `.pt` **不能**接着用这条结构，必须从 `--stage global` 重训。v1/v2 仍可加载推理。
@@ -101,11 +99,7 @@ python3 test.py \
 
 Mac 上整图 LUT 插值在 CPU 上（比原先 numpy 查表快，也比 MPS 扫全图快）。CNN 缩略图可用 `--device mps`，一般对总耗时帮助不大。`--device auto` 会选 CUDA，否则 CPU。
 
-`--edge-lift` 仍作用在最终 CMYK 上（默认轮廓减 K）。新训的模型默认**关掉** `--shadow-lift`，以免把调图师压暗的阴影再提亮；需要暗部减墨时再显式传入，例如 `--shadow-lift 0.06`。旧的 `.npz` 若元数据里仍写着 0.06，行为不变。
-
-v3 模型把直方图/相对 1D/look 写进网络。`test.py` / `server.py` 在 v3 上默认再叠一层 **压黑透亮 + 暖肤**（`--de-gray-cool -0.30`，负数是加黄；舞台仍发灰、皮肤偏冷时用这个，不必等重训）。关掉用 `--no-de-gray`。还不够透把 `--de-gray-shadow-lift` 加到 `0.35`；皮肤仍冷把 cool 调到 `-0.45`。高光软压仍是 0.94。v1/v2 仍默认 `--de-gray-cool 0.55` 去金黄。已生成的文件不会自动更新，需重启服务后重新跑图。
-
-下一轮 `--stage global` 会用更重的暗部损失和中间调暖色铰链（`--punch-weight` / `--warmth-weight`），让网络自己往透亮、偏暖靠，不必全靠后处理。
+`--edge-lift`、`--shadow-lift` 和去灰后处理默认全部 **关闭**。`test.py` / `server.py` 输出就是网络 CMYK。需要时再显式打开，例如 `--de-gray --de-gray-cool 0.25`，或 `--edge-lift 0.05`。v3 内部的 look 属于模型前向，不是这层后处理。已生成的文件不会自动更新，需重启服务后重新跑图。
 
 ## 数据配对
 
@@ -401,7 +395,7 @@ python3 test.py --model models/residual_lut_human_portrait.npz \
   --input in.jpg --output result.tif --edge-lift 0.08
 ```
 
-`--edge-lift 0` 可关掉。审核服务同样支持 `--edge-lift`。没有人像 LUT 时，只要装了 mediapipe，全局模型也会用整身轮廓做这一圈提亮。
+默认不启用。需要时加 `--edge-lift 0.05`。审核服务同样支持该参数。
 
 人像阴影、舞台这类暗场，深色衣服和背景不在轮廓上，`edge-lift` 帮不上。若要把暗部再减墨提亮，推理可按原图亮度减 K（峰值示例 K `0.06`、C/M/Y 各 `0.035`）。新模型默认关闭，以免抵消调图师的 S 曲线压暗：
 
@@ -431,7 +425,7 @@ python3 test.py \
 仓库包含一个无需前端构建工具的本地 Web 系统，支持：
 
 - 批量上传 JPG、PNG、TIFF；
-- 后台并行调用模型，输出带目标 ICC 的 CMYK TIFF（v3 默认压黑透亮 + 暖肤；v1/v2 仍默认去金黄去灰）；
+- 后台并行调用模型，输出带目标 ICC 的 CMYK TIFF（默认无去灰 / edge-lift 后处理）；
 - 为浏览器生成该输出的 sRGB 预览；
 - 原图/调色结果拖动对比；
 - 为每张结果上传像素对齐的 RGB/CMYK 目标图，并切换“原图/模型”或“目标图/模型”拖动对比；

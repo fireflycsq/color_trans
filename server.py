@@ -48,7 +48,7 @@ class AppState:
         edge_lift: float | None = None,
         shadow_lift: float | None = None,
         device: str | None = "auto",
-        de_gray: bool = True,
+        de_gray: bool = False,
         de_gray_shadow_lift: float | None = None,
         de_gray_strength: float | None = None,
         de_gray_highlight_ceiling: float | None = None,
@@ -531,11 +531,11 @@ def main() -> None:
         help="maximum size of one input or target image in MB",
     )
     p.add_argument(
-        "--edge-lift", type=float, default=None,
-        help="silhouette K lift 0..1; default 0.05 from the residual-LUT model. 0 disables",
+        "--edge-lift", type=float, default=0.0,
+        help="silhouette K lift 0..1; default 0 (off). e.g. 0.05 to restore",
     )
     p.add_argument(
-        "--shadow-lift", type=float, default=None,
+        "--shadow-lift", type=float, default=0.0,
         help="dark-tone K lift 0..1; default 0 (off). Use e.g. 0.06 to restore",
     )
     p.add_argument(
@@ -543,8 +543,8 @@ def main() -> None:
         help="PyTorch device for .pt models: auto, cpu, mps, or cuda",
     )
     p.add_argument(
-        "--de-gray", action=argparse.BooleanOptionalAction, default=True,
-        help="write black crush / S / saturation into the CMYK output (and matching preview)",
+        "--de-gray", action=argparse.BooleanOptionalAction, default=False,
+        help="write black crush / S / saturation into the CMYK output; default off",
     )
     p.add_argument(
         "--de-gray-shadow-lift", type=float, default=None,

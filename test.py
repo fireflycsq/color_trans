@@ -53,11 +53,11 @@ def main() -> None:
     p.add_argument("--quality", type=int, default=95)
     p.add_argument("--save-portrait-mask", help="optional PNG of the person-skin mask")
     p.add_argument(
-        "--edge-lift", type=float, default=None,
-        help="silhouette K lift 0..1; default 0.05. Use 0 to disable",
+        "--edge-lift", type=float, default=0.0,
+        help="silhouette K lift 0..1; default 0 (off). e.g. 0.05 to restore",
     )
     p.add_argument(
-        "--shadow-lift", type=float, default=None,
+        "--shadow-lift", type=float, default=0.0,
         help="dark-tone K lift 0..1; default 0 (off). Use e.g. 0.06 to restore",
     )
     p.add_argument(
@@ -65,8 +65,8 @@ def main() -> None:
         help="PyTorch device for .pt models: auto, cpu, mps, or cuda",
     )
     p.add_argument(
-        "--de-gray", action=argparse.BooleanOptionalAction, default=True,
-        help="write black crush / S / saturation into the saved CMYK or JPEG",
+        "--de-gray", action=argparse.BooleanOptionalAction, default=False,
+        help="optional black crush / S / saturation into the saved CMYK; default off",
     )
     p.add_argument(
         "--de-gray-shadow-lift", type=float, default=None,
