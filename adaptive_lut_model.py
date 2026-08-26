@@ -394,6 +394,17 @@ def rgb_to_cmyk_keep_k(rgb, k):
     return torch.stack([c, m, y, k.clamp(0, 1)], dim=-1)
 
 
+def naive_rgb_to_cmyk(rgb):
+    """Standard subtractive CMYK from linear-ish sRGB (same space as naive_cmyk_to_rgb)."""
+    torch, _, _ = _torch()
+    k = (1.0 - rgb.amax(dim=-1)).clamp(0, 1)
+    denom = (1.0 - k).clamp(min=1e-4)
+    c = ((1.0 - rgb[..., 0]) - k) / denom
+    m = ((1.0 - rgb[..., 1]) - k) / denom
+    y = ((1.0 - rgb[..., 2]) - k) / denom
+    return torch.stack([c, m, y, k], dim=-1).clamp(0, 1)
+
+
 def soft_highlights_torch(img, start: float = 0.78, ceiling=0.94):
     torch, _, _ = _torch()
     img = img.clamp(min=0.0)
@@ -447,8 +458,15 @@ def apply_washout_torch(rgb, black, white, look_raw):
 
 
 def apply_look_cmyk_torch(cmyk, look_raw, black, white):
+    """Grade in naive RGB; shadows may update K, highlights keep prior K."""
+    shadow_lift, strength, _, _, _, _ = decode_look(look_raw)
     rgb = apply_washout_torch(naive_cmyk_to_rgb(cmyk), black, white, look_raw)
-    return rgb_to_cmyk_keep_k(rgb, cmyk[..., 3]).clamp(0, 1)
+    keep_k = rgb_to_cmyk_keep_k(rgb, cmyk[..., 3])
+    full = naive_rgb_to_cmyk(rgb)
+    blend = (shadow_lift * 0.55 + strength * 0.45).clamp(0, 1)
+    dark = ((0.50 - rgb_luma(rgb)) / 0.50).clamp(0, 1).unsqueeze(-1)
+    amt = (blend * dark).clamp(0, 1)
+    return ((1.0 - amt) * keep_k + amt * full).clamp(0, 1)
 
 
 def appearance_loss(pred_rgb, target_rgb, huber_fn, delta: float = 0.08):
@@ -466,6 +484,14 @@ def shadow_punch_loss(pred_cmyk, target_cmyk, rgb, boost: float = 0.04):
     pred_d = 0.35 * pred_cmyk[..., :3].mean(dim=-1) + 0.65 * pred_cmyk[..., 3]
     tgt_d = 0.35 * target_cmyk[..., :3].mean(dim=-1) + 0.65 * target_cmyk[..., 3]
     gap = (tgt_d + boost - pred_d).clamp(min=0)
+    return (gap * dark).sum() / dark.sum().clamp_min(1e-6)
+
+
+def shadow_k_loss(pred_cmyk, target_cmyk, rgb, boost: float = 0.03):
+    """Hinge: dark pixels should carry at least as much K as the target (+ boost)."""
+    luma = rgb_luma(rgb)
+    dark = ((0.28 - luma) / 0.28).clamp(0, 1)
+    gap = (target_cmyk[..., 3] + boost - pred_cmyk[..., 3]).clamp(min=0)
     return (gap * dark).sum() / dark.sum().clamp_min(1e-6)
 
 
@@ -547,7 +573,11 @@ def apply_correction_torch(
     lookup = torch_trilinear_fast if fast else torch_trilinear
     residual = lookup(lut, rgb)
     if chroma_only:
-        residual = residual - residual.mean(dim=-1, keepdim=True)
+        cmy = residual[..., :3]
+        residual = torch.cat(
+            [cmy - cmy.mean(dim=-1, keepdim=True), residual[..., 3:4]],
+            dim=-1,
+        )
     gate = lookup(confidence.unsqueeze(-1), rgb)
     out = baseline + gate * residual
     if tone is not None:
@@ -595,7 +625,11 @@ def apply_lut_numpy(
         return np.concatenate(parts, axis=0)
     residual = trilinear_lookup(lut, rgb)
     if chroma_only:
-        residual = residual - residual.mean(axis=-1, keepdims=True)
+        cmy = residual[..., :3]
+        residual = np.concatenate(
+            [cmy - cmy.mean(axis=-1, keepdims=True), residual[..., 3:4]],
+            axis=-1,
+        )
     gate = trilinear_lookup(confidence, rgb)
     out = baseline + gate[..., None] * residual
     if tone is not None:

@@ -17,7 +17,7 @@ Input RGB
     CMYK = ICC + 1D_S(相对 luma) + gate × (3D − mean) + look(CMYK) + 遮罩 × 人像
 ```
 
-全图 CNN 看 256×256 缩略图，并读入该缩略图的亮度直方图与黑白点，这样夜景灰雾和舞台高光不会共用同一条绝对亮度曲线。1D 按本图拉伸后的相对亮度查表；17³×4 残差仍对 CMYK 均值中心化，只学偏色。look 头默认从接近恒等映射起步（拉伸/S/去黄都是学出来的混合量，不是一上来就满血去灰）。人像分支用 MediaPipe 抠人（或皮肤），裁切后再编码第二套 1D+3D+look，只在遮罩内叠到全局结果上。ICC 只做固定基线、不反传。损失是人工 CMYK 的 Huber，加上 naive RGB→Lab 外观项（`--appearance-weight`）。`--icc-look-weight` 默认 0：打开会逼 look 去拟合 ICC 预览差，容易把印刷 CMYK 拉离 target、val ΔE 差过纯 ICC。已有 `adaptive_cmyk_lut_v2` / `v1` / `adaptive_rgb_lut_v1` 的 `.pt` **不能**接着用这条结构，必须从 `--stage global` 重训。v1/v2 仍可加载推理。
+全图 CNN 看 256×256 缩略图，并读入该缩略图的亮度直方图与黑白点，这样夜景灰雾和舞台高光不会共用同一条绝对亮度曲线。1D 按本图拉伸后的相对亮度查表；17³×4 残差仍对 **CMY** 均值中心化（K 保留密度），只学偏色。look 在暗部可按 learned 量更新 K，高光仍尽量保留原 K。look 头默认从接近恒等映射起步（拉伸/S/去黄都是学出来的混合量，不是一上来就满血去灰）。人像分支用 MediaPipe 抠人（或皮肤），裁切后再编码第二套 1D+3D+look，只在遮罩内叠到全局结果上。ICC 只做固定基线、不反传。损失是人工 CMYK 的 Huber，加上 naive RGB→Lab 外观项（`--appearance-weight`）。`--icc-look-weight` 默认 0：打开会逼 look 去拟合 ICC 预览差，容易把印刷 CMYK 拉离 target、val ΔE 差过纯 ICC。已有 `adaptive_cmyk_lut_v2` / `v1` / `adaptive_rgb_lut_v1` 的 `.pt` **不能**接着用这条结构，必须从 `--stage global` 重训。v1/v2 仍可加载推理。
 
 需要 PyTorch：
 
@@ -52,7 +52,8 @@ python3 train_adaptive_lut.py \
   --appearance-weight 1.0 \
   --icc-look-weight 0 \
   --punch-weight 0.35 \
-  --warmth-weight 0.25 \
+  --k-punch-weight 0.35 \
+  --warmth-weight 0 \
   --lut-l1 0.01 \
   --smoothness 0.03 \
   --tone-bins 17 \

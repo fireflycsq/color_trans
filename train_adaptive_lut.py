@@ -39,6 +39,7 @@ from adaptive_lut_model import (
     relative_luma,
     resolve_device,
     shadow_punch_loss,
+    shadow_k_loss,
     stats_black_white,
     tone_smoothness,
     unpack_encoder_out,
@@ -221,6 +222,10 @@ def train_epoch(
             loss = loss + args.punch_weight * shadow_punch_loss(
                 pred, target_t, rgb_loss, boost=args.punch_boost,
             )
+        if args.k_punch_weight > 0:
+            loss = loss + args.k_punch_weight * shadow_k_loss(
+                pred, target_t, rgb_loss, boost=args.k_punch_boost,
+            )
         if args.warmth_weight > 0:
             loss = loss + args.warmth_weight * midtone_warmth_loss(
                 naive_cmyk_to_rgb(pred), naive_cmyk_to_rgb(target_t),
@@ -321,6 +326,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", default="models/adaptive_lut.pt")
     p.add_argument("--output", help="portrait stage output .pt; default overwrites --model")
     p.add_argument("--report")
+    p.add_argument(
+        "--save-every-epoch",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write stem_epochNN.pt after each epoch (no val eval); --no-save-every-epoch disables",
+    )
     p.add_argument("--stage", choices=("global", "portrait"), default="global")
     p.add_argument("--region", choices=("person", "skin"), default="person")
     p.add_argument("--grid-size", type=int, default=17)
@@ -358,6 +369,14 @@ def parse_args() -> argparse.Namespace:
         help="extra CMYK density asked of shadows beyond the target 0..1",
     )
     p.add_argument(
+        "--k-punch-weight", type=float, default=0.35,
+        help="hinge so dark pixels carry at least as much K as the target; 0 disables",
+    )
+    p.add_argument(
+        "--k-punch-boost", type=float, default=0.03,
+        help="extra K asked of shadows beyond the target 0..1",
+    )
+    p.add_argument(
         "--warmth-weight", type=float, default=0.25,
         help="hinge so midtones are not cooler than the target; 0 disables",
     )
@@ -387,6 +406,71 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def wrap_model(args, encoder, icc, loaded, global_encoder, device):
+    if args.stage == "global":
+        return AdaptiveLUTModel(encoder, icc, {}, device=str(device))
+    return AdaptiveLUTModel(
+        global_encoder, icc, dict(loaded.metadata), encoder, str(device),
+    )
+
+
+def checkpoint_path(model_path: Path, epoch: int) -> Path:
+    return model_path.with_name(f"{model_path.stem}_epoch{epoch:02d}{model_path.suffix}")
+
+
+def model_metadata(
+    args, loaded, region, train_pairs, val_pairs, profile_name, profile_hash,
+    status, history, epoch: int,
+):
+    return {
+        **(loaded.metadata if loaded is not None else {}),
+        "model_type": MODEL_TYPE,
+        "tone_split": True,
+        "look_head": True,
+        "relative_tone": not args.absolute_tone,
+        "stat_dim": STAT_DIM,
+        "look_dim": LOOK_DIM,
+        "tone_bins": args.tone_bins,
+        "stage": args.stage,
+        "grid_size": args.grid_size,
+        "encoder_channels": args.channels,
+        "lut_channels": 4,
+        "thumbnail": args.thumbnail,
+        "epochs": args.epochs,
+        "epoch": epoch,
+        "lr": args.lr,
+        "huber_delta_cmyk": args.huber_delta,
+        "luma_weight": args.luma_weight,
+        "cmyk_weight": args.cmyk_weight,
+        "appearance_weight": args.appearance_weight,
+        "appearance_delta": args.appearance_delta,
+        "icc_look_weight": args.icc_look_weight,
+        "punch_weight": args.punch_weight,
+        "punch_boost": args.punch_boost,
+        "k_punch_weight": args.k_punch_weight,
+        "k_punch_boost": args.k_punch_boost,
+        "warmth_weight": args.warmth_weight,
+        "warmth_boost": args.warmth_boost,
+        "lut_l1": args.lut_l1,
+        "smoothness": args.smoothness,
+        "tone_smoothness": args.tone_smoothness,
+        "portrait_region": region if args.stage == "portrait" else None,
+        "portrait_mask_threshold": args.mask_threshold if args.stage == "portrait" else None,
+        "train_pairs": len(train_pairs),
+        "validation_pairs": len(val_pairs),
+        "samples_per_image": sample_budget(len(train_pairs), args.samples_per_image, args.max_samples),
+        "target_profile": profile_name,
+        "target_icc_sha256": profile_hash,
+        "embedded_target_icc_status": status,
+        "edge_lift": 0.0,
+        "edge_lift_c": 0.0,
+        "shadow_lift": 0.0,
+        "shadow_lift_cmy": 0.0,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "history": history,
+    }
+
+
 def main() -> None:
     args = parse_args()
     torch, _ = _torch()
@@ -414,6 +498,10 @@ def main() -> None:
         raise ValueError("--punch-weight 不能为负数")
     if args.punch_boost < 0:
         raise ValueError("--punch-boost 不能为负数")
+    if args.k_punch_weight < 0:
+        raise ValueError("--k-punch-weight 不能为负数")
+    if args.k_punch_boost < 0:
+        raise ValueError("--k-punch-boost 不能为负数")
     if args.warmth_weight < 0:
         raise ValueError("--warmth-weight 不能为负数")
     if args.warmth_boost < 0:
@@ -462,12 +550,13 @@ def main() -> None:
     transform = build_to_cmyk(icc)
     optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
     history = []
+    model_path = Path(args.output or args.model)
     print(
         f"objective: adaptive CMYK v3 | stage={args.stage} | "
         f"hist+rel-1D={args.tone_bins} + lut={args.grid_size}³×4 chroma + look | "
         f"huber={args.huber_delta:g} | luma-weight={args.luma_weight:g} | "
         f"cmyk={args.cmyk_weight:g} appearance={args.appearance_weight:g} "
-        f"punch={args.punch_weight:g} warmth={args.warmth_weight:g} "
+        f"punch={args.punch_weight:g} k-punch={args.k_punch_weight:g} warmth={args.warmth_weight:g} "
         f"icc-look={args.icc_look_weight:g}"
     )
     for epoch in range(1, args.epochs + 1):
@@ -478,60 +567,22 @@ def main() -> None:
         )
         print(f"epoch {epoch} mean loss={mean_loss:.5f}")
         history.append({"epoch": epoch, "train_loss": mean_loss})
+        if args.save_every_epoch:
+            model = wrap_model(args, encoder, icc, loaded, global_encoder, device)
+            model.metadata = model_metadata(
+                args, loaded, region, train_pairs, val_pairs,
+                profile_name, profile_hash, status, history, epoch,
+            )
+            ckpt = checkpoint_path(model_path, epoch)
+            model.save(ckpt)
+            print(f"saved checkpoint: {ckpt.resolve()}", flush=True)
 
-    if args.stage == "global":
-        model = AdaptiveLUTModel(encoder, icc, {}, device=str(device))
-    else:
-        model = AdaptiveLUTModel(
-            global_encoder, icc, dict(loaded.metadata), encoder, str(device),
-        )
-
-    metadata = {
-        **(loaded.metadata if loaded is not None else {}),
-        "model_type": MODEL_TYPE,
-        "tone_split": True,
-        "look_head": True,
-        "relative_tone": not args.absolute_tone,
-        "stat_dim": STAT_DIM,
-        "look_dim": LOOK_DIM,
-        "tone_bins": args.tone_bins,
-        "stage": args.stage,
-        "grid_size": args.grid_size,
-        "encoder_channels": args.channels,
-        "lut_channels": 4,
-        "thumbnail": args.thumbnail,
-        "epochs": args.epochs,
-        "lr": args.lr,
-        "huber_delta_cmyk": args.huber_delta,
-        "luma_weight": args.luma_weight,
-        "cmyk_weight": args.cmyk_weight,
-        "appearance_weight": args.appearance_weight,
-        "appearance_delta": args.appearance_delta,
-        "icc_look_weight": args.icc_look_weight,
-        "punch_weight": args.punch_weight,
-        "punch_boost": args.punch_boost,
-        "warmth_weight": args.warmth_weight,
-        "warmth_boost": args.warmth_boost,
-        "lut_l1": args.lut_l1,
-        "smoothness": args.smoothness,
-        "tone_smoothness": args.tone_smoothness,
-        "portrait_region": region if args.stage == "portrait" else None,
-        "portrait_mask_threshold": args.mask_threshold if args.stage == "portrait" else None,
-        "train_pairs": len(train_pairs),
-        "validation_pairs": len(val_pairs),
-        "samples_per_image": sample_budget(len(train_pairs), args.samples_per_image, args.max_samples),
-        "target_profile": profile_name,
-        "target_icc_sha256": profile_hash,
-        "embedded_target_icc_status": status,
-        "edge_lift": 0.0,
-        "edge_lift_c": 0.0,
-        "shadow_lift": 0.0,
-        "shadow_lift_cmy": 0.0,
-        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "history": history,
-    }
+    model = wrap_model(args, encoder, icc, loaded, global_encoder, device)
+    metadata = model_metadata(
+        args, loaded, region, train_pairs, val_pairs,
+        profile_name, profile_hash, status, history, args.epochs,
+    )
     model.metadata = metadata
-    model_path = Path(args.output or args.model)
     report_path = Path(args.report) if args.report else model_path.with_suffix(".report.json")
     train_metrics = evaluate_pairs(
         model, train_pairs, icc, args.eval_samples_per_image, args.max_eval_samples,
