@@ -224,7 +224,7 @@ def train_epoch(
             )
         if args.k_punch_weight > 0:
             loss = loss + args.k_punch_weight * shadow_k_loss(
-                pred, target_t, rgb_loss, boost=args.k_punch_boost,
+                pred, target_t, rgb_loss, delta=args.k_punch_delta,
             )
         if args.warmth_weight > 0:
             loss = loss + args.warmth_weight * midtone_warmth_loss(
@@ -370,11 +370,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--k-punch-weight", type=float, default=0.35,
-        help="hinge so dark pixels carry at least as much K as the target; 0 disables",
+        help="shadow Huber weight on K vs target; 0 disables",
     )
     p.add_argument(
-        "--k-punch-boost", type=float, default=0.03,
-        help="extra K asked of shadows beyond the target 0..1",
+        "--k-punch-delta", type=float, default=0.125,
+        help="Huber delta for shadow K term in CMYK 0..1 (~32/255)",
     )
     p.add_argument(
         "--warmth-weight", type=float, default=0.25,
@@ -448,7 +448,7 @@ def model_metadata(
         "punch_weight": args.punch_weight,
         "punch_boost": args.punch_boost,
         "k_punch_weight": args.k_punch_weight,
-        "k_punch_boost": args.k_punch_boost,
+        "k_punch_delta": args.k_punch_delta,
         "warmth_weight": args.warmth_weight,
         "warmth_boost": args.warmth_boost,
         "lut_l1": args.lut_l1,
@@ -500,8 +500,8 @@ def main() -> None:
         raise ValueError("--punch-boost 不能为负数")
     if args.k_punch_weight < 0:
         raise ValueError("--k-punch-weight 不能为负数")
-    if args.k_punch_boost < 0:
-        raise ValueError("--k-punch-boost 不能为负数")
+    if args.k_punch_delta <= 0:
+        raise ValueError("--k-punch-delta 必须为正数")
     if args.warmth_weight < 0:
         raise ValueError("--warmth-weight 不能为负数")
     if args.warmth_boost < 0:

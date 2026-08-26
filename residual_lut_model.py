@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageCms
+from PIL import Image
 
-from color_model import image_to_srgb, profile_from_bytes
+from color_model import image_to_srgb, srgb_to_cmyk_transform
 from portrait_mask import (
     has_person_segmenter,
     portrait_edge_weight,
@@ -152,12 +152,7 @@ class ResidualLUTModel:
         source = image_to_srgb(image)
         width, height = source.size
         output = np.empty((height, width, 4), dtype=np.uint8)
-        transform = ImageCms.buildTransform(
-            ImageCms.createProfile("sRGB"),
-            profile_from_bytes(self.target_icc),
-            "RGB", "CMYK", renderingIntent=1,
-            flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
-        )
+        transform = srgb_to_cmyk_transform(self.target_icc)
         strength = float(self.metadata.get("residual_strength", 1.0))
         portrait_strength = float(self.metadata.get("skin_residual_strength", 1.0))
         k_lift, c_lift = edge_lift_amounts(self.metadata, edge_lift)

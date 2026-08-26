@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -71,6 +72,25 @@ def profile_from_bytes(data: bytes) -> ImageCms.ImageCmsProfile:
     return ImageCms.ImageCmsProfile(io.BytesIO(data))
 
 
+@lru_cache(maxsize=8)
+def srgb_to_cmyk_transform(icc: bytes) -> ImageCms.ImageCmsTransform:
+    """Cached sRGB → target-CMYK transform (rel-col intent + BPC)."""
+    return ImageCms.buildTransform(
+        ImageCms.createProfile("sRGB"), profile_from_bytes(icc),
+        "RGB", "CMYK", renderingIntent=1,
+        flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
+    )
+
+
+@lru_cache(maxsize=8)
+def cmyk_to_srgb_transform(icc: bytes) -> ImageCms.ImageCmsTransform:
+    """Cached target-CMYK → display sRGB transform (rel-col intent)."""
+    return ImageCms.buildTransform(
+        profile_from_bytes(icc), ImageCms.createProfile("sRGB"),
+        "CMYK", "RGB", renderingIntent=1,
+    )
+
+
 def apply_embedded_srgb(image: Image.Image, icc: bytes | None = None) -> Image.Image:
     """Convert an RGB-like image, or a 1×N sample strip, through an embedded ICC."""
     rgb = image.convert("RGB")
@@ -101,22 +121,15 @@ def image_to_srgb(image: Image.Image) -> Image.Image:
 
 def render_cmyk_to_srgb(image: Image.Image, icc: bytes, chunk_rows: int = 256) -> Image.Image:
     """Render CMYK through its output profile into display sRGB."""
-    src = profile_from_bytes(icc)
-    dst = ImageCms.createProfile("sRGB")
-    transform = ImageCms.buildTransform(src, dst, "CMYK", "RGB", renderingIntent=1)
     cmyk = image.convert("CMYK")
-    return _apply_transform_rows(cmyk, transform, chunk_rows)
+    return _apply_transform_rows(cmyk, cmyk_to_srgb_transform(icc), chunk_rows)
 
 
 def srgb_to_cmyk(image: Image.Image, icc: bytes, chunk_rows: int = 256) -> Image.Image:
     """Convert display sRGB into the model's target CMYK profile."""
-    src = ImageCms.createProfile("sRGB")
-    dst = profile_from_bytes(icc)
-    transform = ImageCms.buildTransform(
-        src, dst, "RGB", "CMYK", renderingIntent=1,
-        flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
+    return _apply_transform_rows(
+        image.convert("RGB"), srgb_to_cmyk_transform(icc), chunk_rows,
     )
-    return _apply_transform_rows(image.convert("RGB"), transform, chunk_rows)
 
 
 def _apply_transform_rows(image: Image.Image, transform, chunk_rows: int) -> Image.Image:
@@ -344,13 +357,8 @@ class ColorModel:
 
         width, height = source.size
         output = np.empty((height, width, 4), dtype=np.uint8)
-        srgb = ImageCms.createProfile("sRGB")
-        cmyk_profile = profile_from_bytes(self.target_icc)
-        to_cmyk = ImageCms.buildTransform(
-            srgb, cmyk_profile, "RGB", "CMYK", renderingIntent=1,
-            flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
-        )
-        to_rgb = ImageCms.buildTransform(cmyk_profile, srgb, "CMYK", "RGB", renderingIntent=1)
+        to_cmyk = srgb_to_cmyk_transform(self.target_icc)
+        to_rgb = cmyk_to_srgb_transform(self.target_icc)
 
         for y in range(0, height, chunk_rows):
             chunk_image = source.crop((0, y, width, min(y + chunk_rows, height)))

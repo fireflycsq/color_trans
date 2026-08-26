@@ -19,7 +19,7 @@ from color_model import (
     _XYZ_TO_SRGB,
     _XYZ_WHITE,
     image_to_srgb,
-    profile_from_bytes,
+    srgb_to_cmyk_transform,
 )
 from portrait_mask import (
     has_person_segmenter,
@@ -32,7 +32,6 @@ from residual_lut_model import (
     edge_lift_amounts,
     shadow_lift_amounts,
     shadow_weight,
-    trilinear_lookup,
 )
 
 THUMBNAIL = 256
@@ -394,15 +393,9 @@ def rgb_to_cmyk_keep_k(rgb, k):
     return torch.stack([c, m, y, k.clamp(0, 1)], dim=-1)
 
 
-def naive_rgb_to_cmyk(rgb):
-    """Standard subtractive CMYK from linear-ish sRGB (same space as naive_cmyk_to_rgb)."""
-    torch, _, _ = _torch()
-    k = (1.0 - rgb.amax(dim=-1)).clamp(0, 1)
-    denom = (1.0 - k).clamp(min=1e-4)
-    c = ((1.0 - rgb[..., 0]) - k) / denom
-    m = ((1.0 - rgb[..., 1]) - k) / denom
-    y = ((1.0 - rgb[..., 2]) - k) / denom
-    return torch.stack([c, m, y, k], dim=-1).clamp(0, 1)
+def apply_look_cmyk_torch(cmyk, look_raw, black, white):
+    rgb = apply_washout_torch(naive_cmyk_to_rgb(cmyk), black, white, look_raw)
+    return rgb_to_cmyk_keep_k(rgb, cmyk[..., 3]).clamp(0, 1)
 
 
 def soft_highlights_torch(img, start: float = 0.78, ceiling=0.94):
@@ -457,18 +450,6 @@ def apply_washout_torch(rgb, black, white, look_raw):
     return lab_to_srgb_torch(torch.cat([L.unsqueeze(-1), ab], dim=-1))
 
 
-def apply_look_cmyk_torch(cmyk, look_raw, black, white):
-    """Grade in naive RGB; shadows may update K, highlights keep prior K."""
-    shadow_lift, strength, _, _, _, _ = decode_look(look_raw)
-    rgb = apply_washout_torch(naive_cmyk_to_rgb(cmyk), black, white, look_raw)
-    keep_k = rgb_to_cmyk_keep_k(rgb, cmyk[..., 3])
-    full = naive_rgb_to_cmyk(rgb)
-    blend = (shadow_lift * 0.55 + strength * 0.45).clamp(0, 1)
-    dark = ((0.50 - rgb_luma(rgb)) / 0.50).clamp(0, 1).unsqueeze(-1)
-    amt = (blend * dark).clamp(0, 1)
-    return ((1.0 - amt) * keep_k + amt * full).clamp(0, 1)
-
-
 def appearance_loss(pred_rgb, target_rgb, huber_fn, delta: float = 0.08):
     """Lab Huber with extra weight on L (fog/contrast) and less on b (cool/warm)."""
     scale = pred_rgb.new_tensor([28.0, 40.0, 55.0])
@@ -487,12 +468,16 @@ def shadow_punch_loss(pred_cmyk, target_cmyk, rgb, boost: float = 0.04):
     return (gap * dark).sum() / dark.sum().clamp_min(1e-6)
 
 
-def shadow_k_loss(pred_cmyk, target_cmyk, rgb, boost: float = 0.03):
-    """Hinge: dark pixels should carry at least as much K as the target (+ boost)."""
+def shadow_k_loss(pred_cmyk, target_cmyk, rgb, delta: float = 0.125):
+    """Huber on K in shadows: bidirectional match to target K (not just penalise low K)."""
+    torch, _, _ = _torch()
     luma = rgb_luma(rgb)
     dark = ((0.28 - luma) / 0.28).clamp(0, 1)
-    gap = (target_cmyk[..., 3] + boost - pred_cmyk[..., 3]).clamp(min=0)
-    return (gap * dark).sum() / dark.sum().clamp_min(1e-6)
+    diff = (pred_cmyk[..., 3] - target_cmyk[..., 3]).abs()
+    quad = 0.5 * diff.square()
+    lin = delta * (diff - 0.5 * delta)
+    huber = torch.where(diff <= delta, quad, lin)
+    return (huber * dark).sum() / dark.sum().clamp_min(1e-6)
 
 
 def midtone_warmth_loss(pred_rgb, target_rgb, boost: float = 6.0):
@@ -570,6 +555,7 @@ def apply_correction_torch(
     tone_coord=None,
 ):
     """ICC baseline + optional 1D luma S-curve + gated 3D residual."""
+    torch, _, _ = _torch()
     lookup = torch_trilinear_fast if fast else torch_trilinear
     residual = lookup(lut, rgb)
     if chroma_only:
@@ -598,63 +584,12 @@ def apply_lut_torch_fast(rgb, baseline, lut, confidence, tone=None, chroma_only=
     )
 
 
-def apply_lut_numpy(
-    rgb: np.ndarray,
-    baseline: np.ndarray,
-    lut: np.ndarray,
-    confidence: np.ndarray,
-    chunk_rows: int = 128,
-    tone: np.ndarray | None = None,
-    chroma_only: bool = False,
-    tone_coord: np.ndarray | None = None,
-) -> np.ndarray:
-    if rgb.ndim == 3 and rgb.shape[0] > chunk_rows > 0:
-        parts = [
-            apply_lut_numpy(
-                rgb[y:y + chunk_rows],
-                baseline[y:y + chunk_rows],
-                lut,
-                confidence,
-                chunk_rows=0,
-                tone=tone,
-                chroma_only=chroma_only,
-                tone_coord=None if tone_coord is None else tone_coord[y:y + chunk_rows],
-            )
-            for y in range(0, rgb.shape[0], chunk_rows)
-        ]
-        return np.concatenate(parts, axis=0)
-    residual = trilinear_lookup(lut, rgb)
-    if chroma_only:
-        cmy = residual[..., :3]
-        residual = np.concatenate(
-            [cmy - cmy.mean(axis=-1, keepdims=True), residual[..., 3:4]],
-            axis=-1,
-        )
-    gate = trilinear_lookup(confidence, rgb)
-    out = baseline + gate[..., None] * residual
-    if tone is not None:
-        if tone_coord is None:
-            luma = np.clip(
-                rgb[..., 0] * 0.299 + rgb[..., 1] * 0.587 + rgb[..., 2] * 0.114, 0.0, 1.0,
-            )
-        else:
-            luma = np.clip(tone_coord, 0.0, 1.0)
-        bins = tone.shape[0]
-        position = luma * (bins - 1)
-        lower = np.floor(position).astype(np.int64)
-        upper = np.minimum(lower + 1, bins - 1)
-        frac = (position - lower)[..., None]
-        out = out + tone[lower] * (1.0 - frac) + tone[upper] * frac
-    return np.clip(out, 0.0, 1.0)
-
-
 def apply_lut_on_device(
-    rgb, baseline, lut, confidence, device, chunk_rows: int = 128,
+    rgb, baseline, lut, confidence,
     tone=None, chroma_only: bool = False, look=None, stats=None,
     relative_tone: bool = False,
 ):
     """Apply 1D tone + 3D residual + optional look. Interpolation runs on CPU."""
-    del device, chunk_rows
     torch, _, _ = _torch()
     cpu = torch.device("cpu")
     if hasattr(lut, "detach"):
@@ -743,9 +678,10 @@ class AdaptiveLUTModel:
     def portrait_region(self) -> str:
         return portrait_region_from_metadata(self.metadata)
 
-    def encode_lut_tensors(self, encoder, image: Image.Image):
+    def encode_lut_tensors(self, encoder, image: Image.Image, stats=None):
         torch, _, _ = _torch()
-        stats = image_stats_tensor(image, self.device) if self.has_stats else None
+        if stats is None and self.has_stats:
+            stats = image_stats_tensor(image, self.device)
         with torch.no_grad():
             out = encoder(image_to_tensor(image, self.device), stats)
         lut, confidence, tone, look = unpack_encoder_out(out)
@@ -766,12 +702,7 @@ class AdaptiveLUTModel:
         )
 
     def icc_baseline(self, source: Image.Image) -> np.ndarray:
-        transform = ImageCms.buildTransform(
-            ImageCms.createProfile("sRGB"),
-            profile_from_bytes(self.target_icc),
-            "RGB", "CMYK", renderingIntent=1,
-            flags=ImageCms.Flags.BLACKPOINTCOMPENSATION,
-        )
+        transform = srgb_to_cmyk_transform(self.target_icc)
         return np.asarray(ImageCms.applyTransform(source, transform), dtype=np.float32) / 255.0
 
     def correct_cmyk(
@@ -780,17 +711,21 @@ class AdaptiveLUTModel:
         baseline: np.ndarray,
         rgb: np.ndarray | None = None,
         sample_idx: np.ndarray | None = None,
-        chunk_rows: int = 128,
         thumb: Image.Image | None = None,
+        mask: np.ndarray | None = None,
     ) -> np.ndarray:
+        thumbnail = int(self.metadata.get("thumbnail", THUMBNAIL))
         if thumb is None:
-            thumb = resize_square(rgb_u8, int(self.metadata.get("thumbnail", THUMBNAIL)))
-        lut, confidence, tone, look = self.encode_lut_tensors(self.global_encoder, thumb)
+            thumb = resize_square(rgb_u8, thumbnail)
         stats = thumbnail_stats(thumb) if self.has_stats else None
+        stats_t = numpy_to_torch(stats[None, :], self.device) if stats is not None else None
+        lut, confidence, tone, look = self.encode_lut_tensors(
+            self.global_encoder, thumb, stats_t,
+        )
         if rgb is None:
             rgb = rgb_u8.astype(np.float32) / 255.0
         corrected = apply_lut_on_device(
-            rgb, baseline, lut, confidence, self.device, chunk_rows,
+            rgb, baseline, lut, confidence,
             tone=tone, chroma_only=self.tone_split,
             look=look if self.has_look else None,
             stats=stats,
@@ -798,17 +733,20 @@ class AdaptiveLUTModel:
         )
         if self.portrait_encoder is None:
             return corrected
-        region = self.portrait_region
-        mask = portrait_mask(rgb_u8, region=region)
-        crop = portrait_crop(
-            rgb_u8, mask, size=int(self.metadata.get("thumbnail", THUMBNAIL)),
-        )
+        if mask is None:
+            mask = portrait_mask(rgb_u8, region=self.portrait_region)
+        crop = portrait_crop(rgb_u8, mask, size=thumbnail)
         if crop is None:
             return corrected
-        p_lut, p_conf, p_tone, p_look = self.encode_lut_tensors(self.portrait_encoder, crop)
         p_stats = thumbnail_stats(crop) if self.has_stats else None
+        p_stats_t = (
+            numpy_to_torch(p_stats[None, :], self.device) if p_stats is not None else None
+        )
+        p_lut, p_conf, p_tone, p_look = self.encode_lut_tensors(
+            self.portrait_encoder, crop, p_stats_t,
+        )
         portrait = apply_lut_on_device(
-            rgb, corrected, p_lut, p_conf, self.device, chunk_rows,
+            rgb, corrected, p_lut, p_conf,
             tone=p_tone, chroma_only=self.tone_split,
             look=p_look if self.has_look else None,
             stats=p_stats,
@@ -826,21 +764,25 @@ class AdaptiveLUTModel:
         edge_lift: float | None = None,
         shadow_lift: float | None = None,
     ) -> Image.Image:
-        del max_hue_shift, min_saturation
+        del max_hue_shift, min_saturation, chunk_rows
         source = image_to_srgb(image)
         rgb_u8 = np.asarray(source, dtype=np.uint8)
         baseline = self.icc_baseline(source)
-        cmyk = self.correct_cmyk(rgb_u8, baseline, chunk_rows=chunk_rows)
         k_lift, c_lift = edge_lift_amounts(self.metadata, edge_lift)
-        if k_lift > 0 or c_lift > 0:
-            region = self.portrait_region if self.portrait_encoder is not None else "person"
-            if self.portrait_encoder is not None or has_person_segmenter():
-                mask = portrait_mask(rgb_u8, region=region)
-                edge = mask if region == "contour" else portrait_edge_weight(mask)
-                if c_lift > 0:
-                    cmyk[..., 0] -= edge * c_lift
-                if k_lift > 0:
-                    cmyk[..., 3] -= edge * k_lift
+        need_edge = (k_lift > 0 or c_lift > 0) and (
+            self.portrait_encoder is not None or has_person_segmenter()
+        )
+        region = self.portrait_region if self.portrait_encoder is not None else "person"
+        mask = None
+        if self.portrait_encoder is not None or need_edge:
+            mask = portrait_mask(rgb_u8, region=region)
+        cmyk = self.correct_cmyk(rgb_u8, baseline, mask=mask)
+        if need_edge:
+            edge = mask if region == "contour" else portrait_edge_weight(mask)
+            if c_lift > 0:
+                cmyk[..., 0] -= edge * c_lift
+            if k_lift > 0:
+                cmyk[..., 3] -= edge * k_lift
         shadow_k, shadow_cmy = shadow_lift_amounts(self.metadata, shadow_lift)
         if shadow_k > 0 or shadow_cmy > 0:
             dark = shadow_weight(rgb_u8.astype(np.float32) / 255.0)
@@ -888,13 +830,12 @@ class AdaptiveLUTModel:
         grid = int(payload.get("grid_size", metadata.get("grid_size", DEFAULT_GRID)))
         channels = int(payload.get("channels", metadata.get("encoder_channels", DEFAULT_CHANNELS)))
         tone_bins = int(payload.get("tone_bins", metadata.get("tone_bins", DEFAULT_TONE_BINS)))
-        version = model_type if model_type in {MODEL_TYPE, MODEL_TYPE_V2, MODEL_TYPE_V1} else MODEL_TYPE_V2
-        global_encoder = create_adaptive_encoder(grid, channels, tone_bins, version=version)
+        global_encoder = create_adaptive_encoder(grid, channels, tone_bins, version=model_type)
         strict = model_type != MODEL_TYPE_V1
         global_encoder.load_state_dict(payload["global_state"], strict=strict)
         portrait_encoder = None
         if payload.get("portrait_state") is not None:
-            portrait_encoder = create_adaptive_encoder(grid, channels, tone_bins, version=version)
+            portrait_encoder = create_adaptive_encoder(grid, channels, tone_bins, version=model_type)
             portrait_encoder.load_state_dict(payload["portrait_state"], strict=strict)
         if model_type == MODEL_TYPE_V1:
             metadata.setdefault("tone_split", False)
