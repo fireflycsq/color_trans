@@ -220,7 +220,7 @@ class SmallLutEncoder:
                             [
                                 _logit(0.01),
                                 _logit(0.01),
-                                _logit(0.01),
+                                0.0,
                                 _logit(0.99),
                                 0.0,
                                 0.0,
@@ -321,7 +321,7 @@ def decode_look(look_raw):
     look = _as_look_vector(look_raw)
     shadow_lift = look[0].sigmoid()
     strength = look[1].sigmoid()
-    cool = look[2].sigmoid()
+    cool = look[2].tanh()
     highlight_ceiling = 0.85 + 0.15 * look[3].sigmoid()
     black_delta = 0.08 * look[4].tanh()
     white_delta = 0.10 * look[5].tanh()
@@ -442,7 +442,7 @@ def apply_washout_torch(rgb, black, white, look_raw):
     gate = gate.unsqueeze(-1)
     shift = rgb.new_tensor([5.0, 16.0])
     ab = ab - cool * gate * shift
-    ab = ab * (1.0 - 0.10 * cool * gate)
+    ab = ab * (1.0 - 0.10 * cool.abs() * gate)
     return lab_to_srgb_torch(torch.cat([L.unsqueeze(-1), ab], dim=-1))
 
 
@@ -452,10 +452,31 @@ def apply_look_cmyk_torch(cmyk, look_raw, black, white):
 
 
 def appearance_loss(pred_rgb, target_rgb, huber_fn, delta: float = 0.08):
-    scale = pred_rgb.new_tensor([50.0, 25.0, 25.0])
+    """Lab Huber with extra weight on L (fog/contrast) and less on b (cool/warm)."""
+    scale = pred_rgb.new_tensor([28.0, 40.0, 55.0])
     pred = srgb_to_lab_torch(pred_rgb.clamp(0, 1)) / scale
     target = srgb_to_lab_torch(target_rgb.clamp(0, 1)) / scale
     return huber_fn(pred, target, delta=delta)
+
+
+def shadow_punch_loss(pred_cmyk, target_cmyk, rgb, boost: float = 0.04):
+    """Hinge: dark pixels should not be lighter/grayer than the target (+ boost)."""
+    luma = rgb_luma(rgb)
+    dark = ((0.22 - luma) / 0.22).clamp(0, 1)
+    pred_d = 0.35 * pred_cmyk[..., :3].mean(dim=-1) + 0.65 * pred_cmyk[..., 3]
+    tgt_d = 0.35 * target_cmyk[..., :3].mean(dim=-1) + 0.65 * target_cmyk[..., 3]
+    gap = (tgt_d + boost - pred_d).clamp(min=0)
+    return (gap * dark).sum() / dark.sum().clamp_min(1e-6)
+
+
+def midtone_warmth_loss(pred_rgb, target_rgb, boost: float = 6.0):
+    """Hinge: midtones should not be cooler (lower Lab b) than the target (+ boost)."""
+    pred = srgb_to_lab_torch(pred_rgb.clamp(0, 1))
+    tgt = srgb_to_lab_torch(target_rgb.clamp(0, 1))
+    L = tgt[..., 0]
+    gate = ((L - 32.0) / 36.0).clamp(0, 1) * ((98.0 - L) / 28.0).clamp(0, 1)
+    gap = (tgt[..., 2] + boost - pred[..., 2]).clamp(min=0)
+    return (gap * gate).sum() / gate.sum().clamp_min(1e-6)
 
 
 def torch_linear_1d(table, luma):

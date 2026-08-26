@@ -49,14 +49,16 @@ python3 train_adaptive_lut.py \
   --eval-samples-per-image 4096 \
   --max-eval-samples 250000 \
   --huber-delta 0.125 \
-  --luma-weight 1.0 \
+  --luma-weight 1.5 \
   --cmyk-weight 1.0 \
   --appearance-weight 1.0 \
   --icc-look-weight 0 \
+  --punch-weight 0.35 \
+  --warmth-weight 0.25 \
   --lut-l1 0.01 \
   --smoothness 0.03 \
   --tone-bins 17 \
-  --tone-smoothness 0.03 \
+  --tone-smoothness 0.01 \
   --seed 42
 
 python3 train_adaptive_lut.py \
@@ -101,7 +103,9 @@ Mac 上整图 LUT 插值在 CPU 上（比原先 numpy 查表快，也比 MPS 扫
 
 `--edge-lift` 仍作用在最终 CMYK 上（默认轮廓减 K）。新训的模型默认**关掉** `--shadow-lift`，以免把调图师压暗的阴影再提亮；需要暗部减墨时再显式传入，例如 `--shadow-lift 0.06`。旧的 `.npz` 若元数据里仍写着 0.06，行为不变。
 
-v3 模型把去灰写进网络前向（look 头，随每张图的直方图变化）。`test.py` / `server.py` 对 v3 **不再叠加**原来的固定 `--de-gray`。v1/v2 仍默认走后处理去灰：按亮度压灰雾、拉开中间调、温和 S；中间调默认 `--de-gray-cool 0.55`。关掉用 `--no-de-gray`。已生成的文件不会自动更新，需用 v3 重训后的 `.pt` 重新跑图。
+v3 模型把直方图/相对 1D/look 写进网络。`test.py` / `server.py` 在 v3 上默认再叠一层 **压黑透亮 + 暖肤**（`--de-gray-cool -0.30`，负数是加黄；舞台仍发灰、皮肤偏冷时用这个，不必等重训）。关掉用 `--no-de-gray`。还不够透把 `--de-gray-shadow-lift` 加到 `0.35`；皮肤仍冷把 cool 调到 `-0.45`。高光软压仍是 0.94。v1/v2 仍默认 `--de-gray-cool 0.55` 去金黄。已生成的文件不会自动更新，需重启服务后重新跑图。
+
+下一轮 `--stage global` 会用更重的暗部损失和中间调暖色铰链（`--punch-weight` / `--warmth-weight`），让网络自己往透亮、偏暖靠，不必全靠后处理。
 
 ## 数据配对
 
@@ -427,7 +431,7 @@ python3 test.py \
 仓库包含一个无需前端构建工具的本地 Web 系统，支持：
 
 - 批量上传 JPG、PNG、TIFF；
-- 后台并行调用模型，输出带目标 ICC 的 CMYK TIFF（v3 的 look 已写进模型；v1/v2 仍默认后处理去灰）；
+- 后台并行调用模型，输出带目标 ICC 的 CMYK TIFF（v3 默认压黑透亮 + 暖肤；v1/v2 仍默认去金黄去灰）；
 - 为浏览器生成该输出的 sRGB 预览；
 - 原图/调色结果拖动对比；
 - 为每张结果上传像素对齐的 RGB/CMYK 目标图，并切换“原图/模型”或“目标图/模型”拖动对比；

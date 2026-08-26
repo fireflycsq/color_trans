@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from PIL import Image, ImageCms
 
-from color_model import de_gray_cmyk, load_color_model, render_cmyk_to_srgb
+from color_model import de_gray_cmyk, load_color_model, render_cmyk_to_srgb, resolve_de_gray_params
 
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
@@ -49,10 +49,10 @@ class AppState:
         shadow_lift: float | None = None,
         device: str | None = "auto",
         de_gray: bool = True,
-        de_gray_shadow_lift: float = 0.18,
-        de_gray_strength: float = 0.6,
-        de_gray_highlight_ceiling: float = 0.94,
-        de_gray_cool: float = 0.55,
+        de_gray_shadow_lift: float | None = None,
+        de_gray_strength: float | None = None,
+        de_gray_highlight_ceiling: float | None = None,
+        de_gray_cool: float | None = None,
     ):
         self.model = load_color_model(model_path, device=device)
         self.model_path = model_path
@@ -62,10 +62,16 @@ class AppState:
         self.edge_lift = edge_lift
         self.shadow_lift = shadow_lift
         self.de_gray = de_gray
-        self.de_gray_shadow_lift = de_gray_shadow_lift
-        self.de_gray_strength = de_gray_strength
-        self.de_gray_highlight_ceiling = de_gray_highlight_ceiling
-        self.de_gray_cool = de_gray_cool
+        (
+            self.de_gray_shadow_lift,
+            self.de_gray_strength,
+            self.de_gray_highlight_ceiling,
+            self.de_gray_cool,
+        ) = resolve_de_gray_params(
+            bool(getattr(self.model, "has_look", False)),
+            de_gray_shadow_lift, de_gray_strength,
+            de_gray_highlight_ceiling, de_gray_cool,
+        )
         self.max_upload_bytes = max_upload_mb * 1024 * 1024
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
@@ -76,8 +82,6 @@ class AppState:
         return render_cmyk_to_srgb(cmyk, icc or self.model.target_icc)
 
     def apply_de_gray(self, cmyk: Image.Image) -> Image.Image:
-        if getattr(self.model, "has_look", False):
-            return cmyk
         if not self.de_gray:
             return cmyk
         return de_gray_cmyk(
@@ -543,20 +547,20 @@ def main() -> None:
         help="write black crush / S / saturation into the CMYK output (and matching preview)",
     )
     p.add_argument(
-        "--de-gray-shadow-lift", type=float, default=0.18,
-        help="midtone lift 0..1 after black crush; brightens without lifting crushed blacks",
+        "--de-gray-shadow-lift", type=float, default=None,
+        help="midtone lift 0..1 after black crush; v3 default 0.22, otherwise 0.18",
     )
     p.add_argument(
-        "--de-gray-strength", type=float, default=0.6,
-        help="output S-curve and saturation strength 0..1; only used with --de-gray",
+        "--de-gray-strength", type=float, default=None,
+        help="output S-curve and saturation strength 0..1; v3 default 0.45, otherwise 0.6",
     )
     p.add_argument(
-        "--de-gray-highlight-ceiling", type=float, default=0.94,
+        "--de-gray-highlight-ceiling", type=float, default=None,
         help="soft-roll highlights to this 0..1 ceiling so hands/white fabric do not clip",
     )
     p.add_argument(
-        "--de-gray-cool", type=float, default=0.55,
-        help="pull midtone yellow/orange toward pale cyan-gray 0..1",
+        "--de-gray-cool", type=float, default=None,
+        help="midtone Lab shift [-1, 1]; negative warms skin. v3 default -0.30, v1/v2 0.55",
     )
     args = p.parse_args()
     if args.max_upload_mb <= 0:
@@ -565,14 +569,14 @@ def main() -> None:
         raise ValueError("--edge-lift 不能为负数")
     if args.shadow_lift is not None and args.shadow_lift < 0:
         raise ValueError("--shadow-lift 不能为负数")
-    if not 0 <= args.de_gray_shadow_lift <= 1:
+    if args.de_gray_shadow_lift is not None and not 0 <= args.de_gray_shadow_lift <= 1:
         raise ValueError("--de-gray-shadow-lift 必须在 [0, 1] 范围")
-    if not 0 <= args.de_gray_strength <= 1:
+    if args.de_gray_strength is not None and not 0 <= args.de_gray_strength <= 1:
         raise ValueError("--de-gray-strength 必须在 [0, 1] 范围")
-    if not 0.5 <= args.de_gray_highlight_ceiling <= 1:
+    if args.de_gray_highlight_ceiling is not None and not 0.5 <= args.de_gray_highlight_ceiling <= 1:
         raise ValueError("--de-gray-highlight-ceiling 必须在 [0.5, 1] 范围")
-    if not 0 <= args.de_gray_cool <= 1:
-        raise ValueError("--de-gray-cool 必须在 [0, 1] 范围")
+    if args.de_gray_cool is not None and not -1 <= args.de_gray_cool <= 1:
+        raise ValueError("--de-gray-cool 必须在 [-1, 1] 范围")
     app = AppState(
         Path(args.model), Path(args.data), args.workers,
         args.max_hue_shift, args.max_upload_mb, args.edge_lift, args.shadow_lift,
@@ -592,14 +596,13 @@ def main() -> None:
         print(f"Edge lift: {args.edge_lift:g}")
     if args.shadow_lift is not None:
         print(f"Shadow lift: {args.shadow_lift:g}")
-    if getattr(app.model, "has_look", False):
-        print("Output look: baked into adaptive v3 model (CLI --de-gray skipped)")
-    elif app.de_gray:
+    if app.de_gray:
         print(
-            f"Output de-gray: shadow_lift={app.de_gray_shadow_lift:g} "
+            f"Output grade: shadow_lift={app.de_gray_shadow_lift:g} "
             f"strength={app.de_gray_strength:g} "
             f"highlight_ceiling={app.de_gray_highlight_ceiling:g} "
             f"cool={app.de_gray_cool:g}"
+            + (" (v3 punch+warm)" if getattr(app.model, "has_look", False) else "")
         )
     else:
         print("Output de-gray: off")

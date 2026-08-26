@@ -14,6 +14,7 @@ from color_model import (
     image_to_srgb,
     load_color_model,
     render_cmyk_to_srgb,
+    resolve_de_gray_params,
     srgb_to_lab,
 )
 from residual_lut_model import ResidualLUTModel, edge_lift_amounts, shadow_lift_amounts
@@ -68,31 +69,31 @@ def main() -> None:
         help="write black crush / S / saturation into the saved CMYK or JPEG",
     )
     p.add_argument(
-        "--de-gray-shadow-lift", type=float, default=0.18,
-        help="midtone lift 0..1 after black crush; brightens without lifting crushed blacks",
+        "--de-gray-shadow-lift", type=float, default=None,
+        help="midtone lift 0..1 after black crush; v3 default 0.22, otherwise 0.18",
     )
-    p.add_argument("--de-gray-strength", type=float, default=0.6)
+    p.add_argument("--de-gray-strength", type=float, default=None)
     p.add_argument(
-        "--de-gray-highlight-ceiling", type=float, default=0.94,
+        "--de-gray-highlight-ceiling", type=float, default=None,
         help="soft-roll highlights to this 0..1 ceiling so hands/white fabric do not clip",
     )
     p.add_argument(
-        "--de-gray-cool", type=float, default=0.55,
-        help="pull midtone yellow/orange toward pale cyan-gray 0..1",
+        "--de-gray-cool", type=float, default=None,
+        help="midtone Lab shift [-1, 1]; negative warms skin. v3 default -0.30, v1/v2 0.55",
     )
     args = p.parse_args()
     if args.edge_lift is not None and args.edge_lift < 0:
         raise ValueError("--edge-lift 不能为负数")
     if args.shadow_lift is not None and args.shadow_lift < 0:
         raise ValueError("--shadow-lift 不能为负数")
-    if not 0 <= args.de_gray_shadow_lift <= 1:
+    if args.de_gray_shadow_lift is not None and not 0 <= args.de_gray_shadow_lift <= 1:
         raise ValueError("--de-gray-shadow-lift 必须在 [0, 1] 范围")
-    if not 0 <= args.de_gray_strength <= 1:
+    if args.de_gray_strength is not None and not 0 <= args.de_gray_strength <= 1:
         raise ValueError("--de-gray-strength 必须在 [0, 1] 范围")
-    if not 0.5 <= args.de_gray_highlight_ceiling <= 1:
+    if args.de_gray_highlight_ceiling is not None and not 0.5 <= args.de_gray_highlight_ceiling <= 1:
         raise ValueError("--de-gray-highlight-ceiling 必须在 [0.5, 1] 范围")
-    if not 0 <= args.de_gray_cool <= 1:
-        raise ValueError("--de-gray-cool 必须在 [0, 1] 范围")
+    if args.de_gray_cool is not None and not -1 <= args.de_gray_cool <= 1:
+        raise ValueError("--de-gray-cool 必须在 [-1, 1] 范围")
 
     model = load_color_model(args.model, device=args.device)
     src = Image.open(args.input)
@@ -100,13 +101,18 @@ def main() -> None:
     out = Path(args.output)
     is_jpeg = out.suffix.lower() in {".jpg", ".jpeg"}
     baked_look = bool(getattr(model, "has_look", False))
-    if args.de_gray and not baked_look:
+    shadow_lift, strength, ceiling, cool = resolve_de_gray_params(
+        baked_look,
+        args.de_gray_shadow_lift, args.de_gray_strength,
+        args.de_gray_highlight_ceiling, args.de_gray_cool,
+    )
+    if args.de_gray:
         pred = de_gray_cmyk(
             pred, model.target_icc,
-            shadow_lift=args.de_gray_shadow_lift,
-            strength=args.de_gray_strength,
-            highlight_ceiling=args.de_gray_highlight_ceiling,
-            cool=args.de_gray_cool,
+            shadow_lift=shadow_lift,
+            strength=strength,
+            highlight_ceiling=ceiling,
+            cool=cool,
         )
     if is_jpeg:
         preview = render_cmyk_to_srgb(pred, model.target_icc)
@@ -116,7 +122,8 @@ def main() -> None:
         pred.save(out, icc_profile=model.target_icc)
         saved_mode = pred.mode
     de_gray_note = (
-        "v3 look baked" if baked_look else ("de-gray on" if args.de_gray else "de-gray off")
+        f"grade punch+warm cool={cool:g}" if args.de_gray and baked_look
+        else ("de-gray on" if args.de_gray else "de-gray off")
     )
     extras = []
     if isinstance(model, AdaptiveLUTModel):

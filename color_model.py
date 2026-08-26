@@ -156,8 +156,8 @@ def avoid_washout_adjust(
 
     99th-percentile stretch used to hard-clip the brightest 1% to 1.0 (hands,
     white fabric). Those values are kept above 1 and soft-rolled at the end.
-    ``cool`` pulls midtone Lab yellow/orange toward pale cyan-gray so a golden
-    model grade can match a cooler human target.
+    ``cool`` > 0 pulls midtone yellow/orange toward pale cyan-gray; ``cool`` < 0
+    warms midtones (skin). Range is ``[-1, 1]``.
     """
     rgb = image.convert("RGB")
     img_f = np.asarray(rgb, dtype=np.float32) / 255.0
@@ -192,22 +192,22 @@ def avoid_washout_adjust(
     img_f = _soft_highlights(img_f + over, ceiling=highlight_ceiling)
     img_f = np.clip(img_f, 0.0, 1.0)
 
-    if strength > 0 or cool > 0:
+    if strength > 0 or cool != 0:
         sat_gain = 1.0 + np.clip(strength, 0.0, 1.0) * 0.22
-        cool_amt = np.clip(cool, 0.0, 1.0)
+        cool_amt = float(np.clip(cool, -1.0, 1.0))
         rows = []
         chunk = 256
         for y in range(0, img_f.shape[0], chunk):
             lab = srgb_to_lab(img_f[y:y + chunk])
             if strength > 0:
                 lab[..., 1:] *= sat_gain
-            if cool_amt > 0:
+            if cool_amt != 0:
                 L = lab[..., 0]
                 gate = np.clip((L - 32.0) / 36.0, 0.0, 1.0) * np.clip((98.0 - L) / 28.0, 0.0, 1.0)
                 gate = gate[..., None]
                 lab[..., 1:2] = lab[..., 1:2] - 5.0 * cool_amt * gate
                 lab[..., 2:3] = lab[..., 2:3] - 16.0 * cool_amt * gate
-                lab[..., 1:] *= 1.0 - 0.10 * cool_amt * gate
+                lab[..., 1:] *= 1.0 - 0.10 * abs(cool_amt) * gate
             rows.append(lab_to_srgb(lab).astype(np.float32))
         img_f = np.concatenate(rows, axis=0)
 
@@ -237,6 +237,29 @@ def de_gray_cmyk(
         cool=cool,
     )
     return srgb_to_cmyk(rgb, icc)
+
+
+def resolve_de_gray_params(
+    has_look: bool,
+    shadow_lift: float | None,
+    strength: float | None,
+    highlight_ceiling: float | None,
+    cool: float | None,
+) -> tuple[float, float, float, float]:
+    """v3 grades punch + warm skin; v1/v2 keep the old cool de-gray."""
+    if has_look:
+        return (
+            0.22 if shadow_lift is None else shadow_lift,
+            0.45 if strength is None else strength,
+            0.94 if highlight_ceiling is None else highlight_ceiling,
+            -0.30 if cool is None else cool,
+        )
+    return (
+        0.18 if shadow_lift is None else shadow_lift,
+        0.6 if strength is None else strength,
+        0.94 if highlight_ceiling is None else highlight_ceiling,
+        0.55 if cool is None else cool,
+    )
 
 
 def render_cmyk_preview(

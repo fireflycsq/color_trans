@@ -33,10 +33,12 @@ from adaptive_lut_model import (
     image_stats_tensor,
     image_to_tensor,
     lut_smoothness,
+    midtone_warmth_loss,
     naive_cmyk_to_rgb,
     numpy_to_torch,
     relative_luma,
     resolve_device,
+    shadow_punch_loss,
     stats_black_white,
     tone_smoothness,
     unpack_encoder_out,
@@ -215,6 +217,15 @@ def train_epoch(
                 naive_cmyk_to_rgb(pred), naive_cmyk_to_rgb(target_t), F.huber_loss,
                 delta=args.appearance_delta,
             )
+        if args.punch_weight > 0:
+            loss = loss + args.punch_weight * shadow_punch_loss(
+                pred, target_t, rgb_loss, boost=args.punch_boost,
+            )
+        if args.warmth_weight > 0:
+            loss = loss + args.warmth_weight * midtone_warmth_loss(
+                naive_cmyk_to_rgb(pred), naive_cmyk_to_rgb(target_t),
+                boost=args.warmth_boost,
+            )
         if args.icc_look_weight > 0 and look_pred is not None:
             base_srgb = numpy_to_torch(render_samples(baseline, icc), device)
             target_srgb = numpy_to_torch(render_samples(target, icc), device)
@@ -323,7 +334,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-eval-samples", type=int, default=250_000)
     p.add_argument("--huber-delta", type=float, default=0.125, help="Huber delta in CMYK 0..1 (~32/255)")
     p.add_argument(
-        "--luma-weight", type=float, default=1.0,
+        "--luma-weight", type=float, default=1.5,
         help="extra Huber weight at shadows/highlights vs midtones; 0 disables",
     )
     p.add_argument(
@@ -336,7 +347,23 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--appearance-delta", type=float, default=0.08,
-        help="Huber delta in scaled Lab (L/50, a/25, b/25)",
+        help="Huber delta in scaled Lab (L/28, a/40, b/55)",
+    )
+    p.add_argument(
+        "--punch-weight", type=float, default=0.35,
+        help="hinge so dark pixels are at least as dense as the target; 0 disables",
+    )
+    p.add_argument(
+        "--punch-boost", type=float, default=0.04,
+        help="extra CMYK density asked of shadows beyond the target 0..1",
+    )
+    p.add_argument(
+        "--warmth-weight", type=float, default=0.25,
+        help="hinge so midtones are not cooler than the target; 0 disables",
+    )
+    p.add_argument(
+        "--warmth-boost", type=float, default=6.0,
+        help="extra Lab b (yellow) asked of midtones beyond the target",
     )
     p.add_argument(
         "--icc-look-weight", type=float, default=0.0,
@@ -351,7 +378,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smoothness", type=float, default=0.03)
     p.add_argument("--tone-bins", type=int, default=17)
     p.add_argument(
-        "--tone-smoothness", type=float, default=0.03,
+        "--tone-smoothness", type=float, default=0.01,
         help="1D S-curve adjacent-bin smoothness; L1 is not applied to tone",
     )
     p.add_argument("--mask-threshold", type=float, default=0.45)
@@ -383,6 +410,14 @@ def main() -> None:
         raise ValueError("--icc-look-weight 不能为负数")
     if args.appearance_delta <= 0:
         raise ValueError("--appearance-delta 必须为正数")
+    if args.punch_weight < 0:
+        raise ValueError("--punch-weight 不能为负数")
+    if args.punch_boost < 0:
+        raise ValueError("--punch-boost 不能为负数")
+    if args.warmth_weight < 0:
+        raise ValueError("--warmth-weight 不能为负数")
+    if args.warmth_boost < 0:
+        raise ValueError("--warmth-boost 不能为负数")
     device = resolve_device(args.device)
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -432,6 +467,7 @@ def main() -> None:
         f"hist+rel-1D={args.tone_bins} + lut={args.grid_size}³×4 chroma + look | "
         f"huber={args.huber_delta:g} | luma-weight={args.luma_weight:g} | "
         f"cmyk={args.cmyk_weight:g} appearance={args.appearance_weight:g} "
+        f"punch={args.punch_weight:g} warmth={args.warmth_weight:g} "
         f"icc-look={args.icc_look_weight:g}"
     )
     for epoch in range(1, args.epochs + 1):
@@ -472,6 +508,10 @@ def main() -> None:
         "appearance_weight": args.appearance_weight,
         "appearance_delta": args.appearance_delta,
         "icc_look_weight": args.icc_look_weight,
+        "punch_weight": args.punch_weight,
+        "punch_boost": args.punch_boost,
+        "warmth_weight": args.warmth_weight,
+        "warmth_boost": args.warmth_boost,
         "lut_l1": args.lut_l1,
         "smoothness": args.smoothness,
         "tone_smoothness": args.tone_smoothness,
