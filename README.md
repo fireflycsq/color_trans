@@ -42,6 +42,10 @@ python3 train_adaptive_lut.py \
   --thumbnail 256 \
   --epochs 6 \
   --lr 1e-3 \
+  --early-stopping-patience 3 \
+  --lr-patience 1 \
+  --lr-factor 0.5 \
+  --min-lr 1e-6 \
   --samples-per-image 8192 \
   --max-samples 1500000 \
   --eval-samples-per-image 4096 \
@@ -77,6 +81,13 @@ python3 train_adaptive_lut.py \
   --mask-threshold 0.45 \
   --seed 42
 ```
+
+自适应训练在每个 epoch 后使用固定的验证采样评估平均 ΔE76，并用
+`ReduceLROnPlateau` 降低学习率。`--model` / `--output` 始终保存验证 ΔE76
+最低的权重；连续 `--early-stopping-patience` 个 epoch 没有改善时提前停止。
+若没有验证集，则模型选择和 early stopping 自动禁用，scheduler 改用训练 loss。
+报告只保存目标图片内嵌 ICC 状态的汇总计数，不写入逐图片 ICC 记录，避免
+大量 profile 不一致条目淹没训练历史和验证指标。
 
 人像阶段会冻结全局 CNN，只训人像裁切上的第二张 LUT。`--region skin` 只在皮肤上混合人像 LUT。输入和目标分目录时：
 

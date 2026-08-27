@@ -330,7 +330,7 @@ def parse_args() -> argparse.Namespace:
         "--save-every-epoch",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="write stem_epochNN.pt after each epoch (no val eval); --no-save-every-epoch disables",
+        help="write stem_epochNN.pt after each epoch; --no-save-every-epoch disables",
     )
     p.add_argument("--stage", choices=("global", "portrait"), default="global")
     p.add_argument("--region", choices=("person", "skin"), default="person")
@@ -339,6 +339,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--thumbnail", type=int, default=THUMBNAIL)
     p.add_argument("--epochs", type=int, default=6)
     p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument(
+        "--early-stopping-patience", type=int, default=3,
+        help="stop after this many consecutive epochs without lower validation mean DeltaE; 0 disables",
+    )
+    p.add_argument(
+        "--lr-patience", type=int, default=1,
+        help="ReduceLROnPlateau patience measured in validation epochs",
+    )
+    p.add_argument(
+        "--lr-factor", type=float, default=0.5,
+        help="ReduceLROnPlateau learning-rate multiplier",
+    )
+    p.add_argument("--min-lr", type=float, default=1e-6)
     p.add_argument("--samples-per-image", type=int, default=8_192)
     p.add_argument("--max-samples", type=int, default=1_500_000)
     p.add_argument("--eval-samples-per-image", type=int, default=4_096)
@@ -439,6 +452,11 @@ def model_metadata(
         "epochs": args.epochs,
         "epoch": epoch,
         "lr": args.lr,
+        "early_stopping_patience": args.early_stopping_patience,
+        "lr_scheduler": "ReduceLROnPlateau",
+        "lr_patience": args.lr_patience,
+        "lr_factor": args.lr_factor,
+        "min_lr": args.min_lr,
         "huber_delta_cmyk": args.huber_delta,
         "luma_weight": args.luma_weight,
         "cmyk_weight": args.cmyk_weight,
@@ -480,6 +498,14 @@ def main() -> None:
         raise ValueError("--grid-size 必须至少为 2")
     if args.epochs < 1:
         raise ValueError("--epochs 必须至少为 1")
+    if args.early_stopping_patience < 0:
+        raise ValueError("--early-stopping-patience 不能为负数")
+    if args.lr_patience < 0:
+        raise ValueError("--lr-patience 不能为负数")
+    if not 0 < args.lr_factor < 1:
+        raise ValueError("--lr-factor 必须在 (0, 1) 范围")
+    if args.min_lr < 0:
+        raise ValueError("--min-lr 不能为负数")
     if args.tone_bins < 2:
         raise ValueError("--tone-bins 必须至少为 2")
     if args.tone_smoothness < 0:
@@ -549,8 +575,27 @@ def main() -> None:
 
     transform = build_to_cmyk(icc)
     optimizer = torch.optim.Adam(encoder.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=args.lr_factor,
+        patience=args.lr_patience,
+        min_lr=args.min_lr,
+    )
     history = []
     model_path = Path(args.output or args.model)
+    best_state = None
+    best_val_metrics = None
+    best_val_delta_e = float("inf")
+    best_epoch = 0
+    epochs_without_improvement = 0
+    stopped_early = False
+    completed_epochs = 0
+    if not val_pairs:
+        print(
+            "warning: no validation pairs; validation checkpoint selection and early stopping are disabled",
+            flush=True,
+        )
     print(
         f"objective: adaptive CMYK v3 | stage={args.stage} | "
         f"hist+rel-1D={args.tone_bins} + lut={args.grid_size}³×4 chroma + look | "
@@ -560,47 +605,120 @@ def main() -> None:
         f"icc-look={args.icc_look_weight:g}"
     )
     for epoch in range(1, args.epochs + 1):
+        completed_epochs = epoch
+        epoch_lr = float(optimizer.param_groups[0]["lr"])
         print(f"epoch {epoch}/{args.epochs} stage={args.stage}")
         mean_loss = train_epoch(
             encoder, optimizer, train_pairs, transform, args, device,
             args.seed + epoch * 17, icc, global_encoder, region,
         )
         print(f"epoch {epoch} mean loss={mean_loss:.5f}")
-        history.append({"epoch": epoch, "train_loss": mean_loss})
-        if args.save_every_epoch:
-            model = wrap_model(args, encoder, icc, loaded, global_encoder, device)
-            model.metadata = model_metadata(
-                args, loaded, region, train_pairs, val_pairs,
-                profile_name, profile_hash, status, history, epoch,
+        epoch_model = wrap_model(args, encoder, icc, loaded, global_encoder, device)
+        epoch_metadata = model_metadata(
+            args, loaded, region, train_pairs, val_pairs,
+            profile_name, profile_hash, status, history, epoch,
+        )
+        epoch_model.metadata = epoch_metadata
+        epoch_val_metrics = evaluate_pairs(
+            epoch_model, val_pairs, icc,
+            args.eval_samples_per_image, args.max_eval_samples,
+            args.seed + 2_000_000, f"val epoch {epoch}",
+        )
+        history_item = {
+            "epoch": epoch,
+            "train_loss": mean_loss,
+            "lr": epoch_lr,
+        }
+        improved = False
+        if epoch_val_metrics is not None:
+            val_delta_e = float(epoch_val_metrics["icc_plus_lut"]["delta_e76"]["mean"])
+            history_item["validation_delta_e76_mean"] = val_delta_e
+            improved = val_delta_e < best_val_delta_e
+            history_item["improved"] = improved
+            scheduler.step(val_delta_e)
+            history_item["next_lr"] = float(optimizer.param_groups[0]["lr"])
+            if improved:
+                best_val_delta_e = val_delta_e
+                best_epoch = epoch
+                best_val_metrics = epoch_val_metrics
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in encoder.state_dict().items()
+                }
+                epochs_without_improvement = 0
+            else:
+                epochs_without_improvement += 1
+        else:
+            scheduler.step(mean_loss)
+            history_item["next_lr"] = float(optimizer.param_groups[0]["lr"])
+        history.append(history_item)
+        epoch_metadata["history"] = history
+        epoch_metadata["validation_metrics"] = epoch_val_metrics
+        epoch_metadata["best_epoch"] = best_epoch or None
+        epoch_metadata["best_validation_delta_e76_mean"] = (
+            best_val_delta_e if best_epoch else None
+        )
+        epoch_model.metadata = epoch_metadata
+        if improved:
+            epoch_model.save(model_path)
+            print(
+                f"saved best model: {model_path.resolve()} "
+                f"(epoch={epoch}, val DeltaE76={best_val_delta_e:.4f})",
+                flush=True,
             )
+        if args.save_every_epoch:
             ckpt = checkpoint_path(model_path, epoch)
-            model.save(ckpt)
+            epoch_model.save(ckpt)
             print(f"saved checkpoint: {ckpt.resolve()}", flush=True)
+        if (
+            epoch_val_metrics is not None
+            and args.early_stopping_patience > 0
+            and epochs_without_improvement >= args.early_stopping_patience
+        ):
+            stopped_early = True
+            print(
+                f"early stopping: validation DeltaE76 did not improve for "
+                f"{epochs_without_improvement} consecutive epochs; best epoch={best_epoch}",
+                flush=True,
+            )
+            break
+
+    if best_state is not None:
+        encoder.load_state_dict(best_state)
+        print(
+            f"restored best weights from epoch {best_epoch} "
+            f"(val DeltaE76={best_val_delta_e:.4f})",
+            flush=True,
+        )
 
     model = wrap_model(args, encoder, icc, loaded, global_encoder, device)
     metadata = model_metadata(
         args, loaded, region, train_pairs, val_pairs,
-        profile_name, profile_hash, status, history, args.epochs,
+        profile_name, profile_hash, status, history, best_epoch or completed_epochs,
     )
+    metadata["completed_epochs"] = completed_epochs
+    metadata["best_epoch"] = best_epoch or None
+    metadata["best_validation_delta_e76_mean"] = best_val_delta_e if best_epoch else None
+    metadata["stopped_early"] = stopped_early
     model.metadata = metadata
     report_path = Path(args.report) if args.report else model_path.with_suffix(".report.json")
     train_metrics = evaluate_pairs(
         model, train_pairs, icc, args.eval_samples_per_image, args.max_eval_samples,
         args.seed + 1_000_000, "train",
     )
-    val_metrics = evaluate_pairs(
-        model, val_pairs, icc, args.eval_samples_per_image, args.max_eval_samples,
-        args.seed + 2_000_000, "val",
-    )
+    # The same deterministic validation sample was already evaluated when the
+    # best checkpoint was selected, so avoid decoding the validation set again.
+    val_metrics = best_val_metrics
     metadata["train_metrics"] = train_metrics
     metadata["validation_metrics"] = val_metrics
     model.metadata = metadata
     model.save(model_path)
-    report = metadata | {
-        "model": model_path.name,
-        "train_images": train_records,
-        "validation_images": val_records,
-    }
+    # Per-image ICC records can dominate the report when a fixed target ICC is
+    # intentionally assigned to many files carrying a different embedded
+    # profile. Keep only the compact status counts in
+    # ``embedded_target_icc_status``; validation/training metrics stay easy to
+    # inspect near the top-level report.
+    report = metadata | {"model": model_path.name}
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), "utf-8")
     print(f"saved model: {model_path.resolve()}")
