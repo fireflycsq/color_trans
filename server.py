@@ -291,8 +291,11 @@ class AppState:
                 target.draft(target.mode, (1800, 1800))
                 target.thumbnail((1800, 1800), Image.Resampling.LANCZOS)
                 if target.mode == "CMYK":
-                    icc = target.info.get("icc_profile") or self.model.target_icc
-                    preview = self.render_preview(target, icc)
+                    # Training treats target CMYK values as belonging to the
+                    # model's fixed output profile without converting their
+                    # pixels. Render review targets through that same profile
+                    # so target and model output use identical ICC conditions.
+                    preview = self.render_preview(target, self.model.target_icc)
                 else:
                     icc = target.info.get("icc_profile")
                     if icc:
