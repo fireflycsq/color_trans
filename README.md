@@ -91,6 +91,13 @@ python3 train_adaptive_lut.py \
 
 人像阶段会冻结全局 CNN，只训人像裁切上的第二张 LUT。`--region skin` 只在皮肤上混合人像 LUT。输入和目标分目录时：
 
+人像阶段每个 epoch 同时验证 `global only` 与 `global + portrait`，并只在
+`mask >= --mask-threshold` 的像素内计算专用 ΔE76。scheduler、最佳模型选择和
+early stopping 均以该人像遮罩指标为准。若没有任何 epoch 优于冻结的全图模型，
+`--output` 会保存不含人像分支的 global-only 安全回退模型，并在报告中记录
+`portrait_accepted: false`。训练、验证和推理的人像 mask/crop 均使用规范化后的
+sRGB 输入，避免带 Adobe RGB 等内嵌 ICC 的图片在三个阶段产生不同裁切。
+
 ```bash
 python3 train_adaptive_lut.py \
   --stage global \

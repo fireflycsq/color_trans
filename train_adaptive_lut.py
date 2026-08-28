@@ -89,6 +89,12 @@ def load_pair_arrays(
     return rgb_u8, target_u8, src_icc, thumb
 
 
+def full_srgb_array(rgb_u8: np.ndarray, icc: bytes | None) -> np.ndarray:
+    """Normalize a full RGB array for portrait masking/cropping and inference parity."""
+    image = Image.fromarray(np.asarray(rgb_u8, dtype=np.uint8), "RGB")
+    return np.asarray(apply_embedded_srgb(image, icc), dtype=np.uint8)
+
+
 def icc_samples(rgb_u8: np.ndarray, transform) -> np.ndarray:
     strip = Image.fromarray(np.asarray(rgb_u8, dtype=np.uint8)[None, ...], "RGB")
     return np.asarray(ImageCms.applyTransform(strip, transform), dtype=np.float32)[0] / 255.0
@@ -180,13 +186,15 @@ def train_epoch(
                 rgb_t, base_t, thumb_stats, relative_tone,
             )
         else:
-            mask_img = portrait_mask(rgb_u8, region=region)
-            crop = portrait_crop(rgb_u8, mask_img, args.thumbnail, args.mask_threshold)
+            portrait_rgb_u8 = full_srgb_array(rgb_u8, src_icc)
+            mask_img = portrait_mask(portrait_rgb_u8, region=region)
+            crop = portrait_crop(
+                portrait_rgb_u8, mask_img, args.thumbnail, args.mask_threshold,
+            )
             mask = mask_img.reshape(-1)[idx]
             if crop is None or float(mask.max()) < args.mask_threshold:
                 print(f"[train {i:>4}/{len(pairs)}] {pair.name}: no {region} crop", flush=True)
                 continue
-            crop = apply_embedded_srgb(crop, src_icc)
             crop_stats = image_stats_tensor(crop, device)
             with torch.no_grad():
                 base, _, _, _ = apply_split(
@@ -267,7 +275,17 @@ def evaluate_pairs(
         return None
     transform = build_to_cmyk(icc)
     budget = sample_budget(len(pairs), per_image, maximum)
+    compare_global = model.portrait_encoder is not None
+    global_model = None
+    if compare_global:
+        global_model = AdaptiveLUTModel(
+            model.global_encoder, icc, dict(model.metadata), device=str(model.device),
+        )
+    threshold = float(model.metadata.get("portrait_mask_threshold", 0.45))
+    region = model.portrait_region
     baselines, preds, targets = [], [], []
+    global_preds = []
+    masked_globals, masked_preds, masked_targets = [], [], []
     for i, pair in enumerate(pairs, 1):
         with Image.open(pair.source) as preview:
             width, height = preview.size
@@ -280,14 +298,37 @@ def evaluate_pairs(
         rgb, baseline, target, idx = sample_pixels(
             rgb_u8, target_u8, budget, seed + i, transform, src_icc,
         )
-        pred = model.correct_cmyk(rgb_u8, baseline, rgb=rgb, sample_idx=idx, thumb=thumb)
+        model_rgb_u8 = full_srgb_array(rgb_u8, src_icc) if compare_global else rgb_u8
+        mask = portrait_mask(model_rgb_u8, region=region) if compare_global else None
+        pred = model.correct_cmyk(
+            model_rgb_u8, baseline, rgb=rgb, sample_idx=idx, thumb=thumb, mask=mask,
+        )
         pair_icc = metric_summary(baseline, target, icc)
         pair_model = metric_summary(pred, target, icc)
+        portrait_note = ""
+        if compare_global:
+            global_pred = global_model.correct_cmyk(
+                model_rgb_u8, baseline, rgb=rgb, sample_idx=idx, thumb=thumb,
+            )
+            keep = mask.reshape(-1)[idx] >= threshold
+            global_preds.append(global_pred)
+            if np.any(keep):
+                masked_globals.append(global_pred[keep])
+                masked_preds.append(pred[keep])
+                masked_targets.append(target[keep])
+                pair_mask_global = metric_summary(global_pred[keep], target[keep], icc)
+                pair_mask_model = metric_summary(pred[keep], target[keep], icc)
+                portrait_note = (
+                    f" portrait global/model ΔE="
+                    f"{pair_mask_global['delta_e76']['mean']:.3f}/"
+                    f"{pair_mask_model['delta_e76']['mean']:.3f}"
+                )
         print(
             f"[{label} {i:>4}/{len(pairs)}] {pair.name}: "
             f"ICC ΔE={pair_icc['delta_e76']['mean']:.3f} "
             f"model ΔE={pair_model['delta_e76']['mean']:.3f} "
-            f"CMYK MAE={np.round(pair_model['cmyk_mae'], 1).tolist()}",
+            f"CMYK MAE={np.round(pair_model['cmyk_mae'], 1).tolist()}"
+            f"{portrait_note}",
             flush=True,
         )
         baselines.append(baseline)
@@ -299,7 +340,7 @@ def evaluate_pairs(
     icc_metrics = metric_summary(base, target, icc)
     model_metrics = metric_summary(pred, target, icc)
     base_de, model_de = icc_metrics["delta_e76"]["mean"], model_metrics["delta_e76"]["mean"]
-    return {
+    result = {
         "pairs": len(pairs),
         "samples": int(len(pred)),
         "icc_baseline": icc_metrics,
@@ -308,6 +349,39 @@ def evaluate_pairs(
         "cmyk_mae": model_metrics["cmyk_mae"],
         "delta_e76": model_metrics["delta_e76"],
     }
+    if compare_global:
+        if not masked_preds:
+            raise ValueError(
+                f"{label} 验证集中没有达到 mask threshold {threshold:g} 的 {region} 像素"
+            )
+        global_pred = np.concatenate(global_preds)
+        masked_global = np.concatenate(masked_globals)
+        masked_pred = np.concatenate(masked_preds)
+        masked_target = np.concatenate(masked_targets)
+        global_metrics = metric_summary(global_pred, target, icc)
+        mask_global_metrics = metric_summary(masked_global, masked_target, icc)
+        mask_model_metrics = metric_summary(masked_pred, masked_target, icc)
+        full_global_de = global_metrics["delta_e76"]["mean"]
+        mask_global_de = mask_global_metrics["delta_e76"]["mean"]
+        mask_model_de = mask_model_metrics["delta_e76"]["mean"]
+        result["global_only"] = global_metrics
+        result["global_plus_portrait"] = model_metrics
+        result["global_to_portrait_delta_e76_improvement_percent"] = (
+            float(100 * (full_global_de - model_de) / full_global_de)
+            if full_global_de else 0.0
+        )
+        result["portrait_mask"] = {
+            "region": region,
+            "threshold": threshold,
+            "samples": int(len(masked_pred)),
+            "global_only": mask_global_metrics,
+            "global_plus_portrait": mask_model_metrics,
+            "delta_e76_improvement_percent": (
+                float(100 * (mask_global_de - mask_model_de) / mask_global_de)
+                if mask_global_de else 0.0
+            ),
+        }
+    return result
 
 
 def parse_args() -> argparse.Namespace:
@@ -457,6 +531,10 @@ def model_metadata(
         "lr_patience": args.lr_patience,
         "lr_factor": args.lr_factor,
         "min_lr": args.min_lr,
+        "validation_selection_metric": (
+            "portrait_mask_delta_e76_mean"
+            if args.stage == "portrait" else "full_frame_delta_e76_mean"
+        ),
         "huber_delta_cmyk": args.huber_delta,
         "luma_weight": args.luma_weight,
         "cmyk_weight": args.cmyk_weight,
@@ -588,6 +666,8 @@ def main() -> None:
     best_val_metrics = None
     best_val_delta_e = float("inf")
     best_epoch = 0
+    portrait_global_val_delta_e = None
+    last_val_metrics = None
     epochs_without_improvement = 0
     stopped_early = False
     completed_epochs = 0
@@ -624,6 +704,7 @@ def main() -> None:
             args.eval_samples_per_image, args.max_eval_samples,
             args.seed + 2_000_000, f"val epoch {epoch}",
         )
+        last_val_metrics = epoch_val_metrics
         history_item = {
             "epoch": epoch,
             "train_loss": mean_loss,
@@ -631,9 +712,25 @@ def main() -> None:
         }
         improved = False
         if epoch_val_metrics is not None:
-            val_delta_e = float(epoch_val_metrics["icc_plus_lut"]["delta_e76"]["mean"])
+            if args.stage == "portrait":
+                portrait_metrics = epoch_val_metrics["portrait_mask"]
+                val_delta_e = float(
+                    portrait_metrics["global_plus_portrait"]["delta_e76"]["mean"]
+                )
+                portrait_global_val_delta_e = float(
+                    portrait_metrics["global_only"]["delta_e76"]["mean"]
+                )
+                history_item["portrait_mask_global_only_delta_e76_mean"] = (
+                    portrait_global_val_delta_e
+                )
+                history_item["portrait_mask_delta_e76_mean"] = val_delta_e
+                beats_global = val_delta_e < portrait_global_val_delta_e
+                improved = beats_global and val_delta_e < best_val_delta_e
+                history_item["beats_global_only"] = beats_global
+            else:
+                val_delta_e = float(epoch_val_metrics["icc_plus_lut"]["delta_e76"]["mean"])
+                improved = val_delta_e < best_val_delta_e
             history_item["validation_delta_e76_mean"] = val_delta_e
-            improved = val_delta_e < best_val_delta_e
             history_item["improved"] = improved
             scheduler.step(val_delta_e)
             history_item["next_lr"] = float(optimizer.param_groups[0]["lr"])
@@ -662,8 +759,9 @@ def main() -> None:
         if improved:
             epoch_model.save(model_path)
             print(
-                f"saved best model: {model_path.resolve()} "
-                f"(epoch={epoch}, val DeltaE76={best_val_delta_e:.4f})",
+                f"saved best model: {model_path.resolve()} (epoch={epoch}, "
+                f"{'portrait-mask ' if args.stage == 'portrait' else ''}"
+                f"val DeltaE76={best_val_delta_e:.4f})",
                 flush=True,
             )
         if args.save_every_epoch:
@@ -678,7 +776,8 @@ def main() -> None:
             stopped_early = True
             print(
                 f"early stopping: validation DeltaE76 did not improve for "
-                f"{epochs_without_improvement} consecutive epochs; best epoch={best_epoch}",
+                f"{epochs_without_improvement} consecutive epochs; "
+                f"best epoch={best_epoch or 'global-only baseline'}",
                 flush=True,
             )
             break
@@ -691,7 +790,20 @@ def main() -> None:
             flush=True,
         )
 
-    model = wrap_model(args, encoder, icc, loaded, global_encoder, device)
+    portrait_rejected = (
+        args.stage == "portrait" and bool(val_pairs) and best_state is None
+    )
+    if portrait_rejected:
+        print(
+            "portrait branch rejected: no epoch improved validation DeltaE76 "
+            "inside the portrait mask; saving global-only fallback",
+            flush=True,
+        )
+        model = AdaptiveLUTModel(
+            global_encoder, icc, dict(loaded.metadata), device=str(device),
+        )
+    else:
+        model = wrap_model(args, encoder, icc, loaded, global_encoder, device)
     metadata = model_metadata(
         args, loaded, region, train_pairs, val_pairs,
         profile_name, profile_hash, status, history, best_epoch or completed_epochs,
@@ -700,6 +812,12 @@ def main() -> None:
     metadata["best_epoch"] = best_epoch or None
     metadata["best_validation_delta_e76_mean"] = best_val_delta_e if best_epoch else None
     metadata["stopped_early"] = stopped_early
+    metadata["portrait_accepted"] = (
+        None if args.stage != "portrait" or not val_pairs else not portrait_rejected
+    )
+    metadata["portrait_global_only_validation_delta_e76_mean"] = (
+        portrait_global_val_delta_e
+    )
     model.metadata = metadata
     report_path = Path(args.report) if args.report else model_path.with_suffix(".report.json")
     train_metrics = evaluate_pairs(
@@ -707,8 +825,17 @@ def main() -> None:
         args.seed + 1_000_000, "train",
     )
     # The same deterministic validation sample was already evaluated when the
-    # best checkpoint was selected, so avoid decoding the validation set again.
-    val_metrics = best_val_metrics
+    # best checkpoint was selected. A rejected portrait branch is evaluated
+    # once more because the saved output is the global-only fallback.
+    if portrait_rejected:
+        metadata["rejected_portrait_validation_metrics"] = last_val_metrics
+        val_metrics = evaluate_pairs(
+            model, val_pairs, icc,
+            args.eval_samples_per_image, args.max_eval_samples,
+            args.seed + 2_000_000, "val global-only fallback",
+        )
+    else:
+        val_metrics = best_val_metrics
     metadata["train_metrics"] = train_metrics
     metadata["validation_metrics"] = val_metrics
     model.metadata = metadata
@@ -730,6 +857,18 @@ def main() -> None:
         print(f"val ΔE76 +LUT mean/p95: {after['mean']:.3f} / {after['p95']:.3f}")
         print(f"val CMYK MAE [C M Y K]: {np.round(val_metrics['cmyk_mae'], 2).tolist()}")
         print(f"val mean improvement: {val_metrics['delta_e76_improvement_percent']:.2f}%")
+        if args.stage == "portrait" and not portrait_rejected:
+            portrait_metrics = val_metrics["portrait_mask"]
+            portrait_before = portrait_metrics["global_only"]["delta_e76"]
+            portrait_after = portrait_metrics["global_plus_portrait"]["delta_e76"]
+            print(
+                f"val portrait-mask ΔE76 global/model mean: "
+                f"{portrait_before['mean']:.3f} / {portrait_after['mean']:.3f}"
+            )
+            print(
+                f"val portrait-mask improvement: "
+                f"{portrait_metrics['delta_e76_improvement_percent']:.2f}%"
+            )
 
 
 if __name__ == "__main__":
