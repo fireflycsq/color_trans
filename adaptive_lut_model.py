@@ -552,7 +552,7 @@ def torch_trilinear_fast(table, rgb):
 
 def apply_correction_torch(
     rgb, baseline, lut, confidence, tone=None, chroma_only=False, fast=False,
-    tone_coord=None,
+    tone_coord=None, residual_limits=None,
 ):
     """ICC baseline + optional 1D luma S-curve + gated 3D residual."""
     torch, _, _ = _torch()
@@ -564,6 +564,21 @@ def apply_correction_torch(
             [cmy - cmy.mean(dim=-1, keepdim=True), residual[..., 3:4]],
             dim=-1,
         )
+    if residual_limits is not None:
+        if hasattr(residual_limits, "to"):
+            limits = residual_limits.to(device=residual.device, dtype=residual.dtype)
+        else:
+            limits = numpy_to_torch(
+                np.asarray(residual_limits, dtype=np.float32), residual.device,
+            )
+        limits = limits.reshape(-1)
+        if limits.numel() != residual.shape[-1]:
+            raise ValueError(
+                f"residual_limits 需要 {residual.shape[-1]} 个通道，实际为 {limits.numel()}"
+            )
+        # Bound the effective interpolated and mean-centred residual, rather
+        # than only the LUT nodes. tanh keeps the limiter differentiable.
+        residual = limits * torch.tanh(residual / limits.clamp_min(1e-6))
     gate = lookup(confidence.unsqueeze(-1), rgb)
     out = baseline + gate * residual
     if tone is not None:
@@ -572,22 +587,30 @@ def apply_correction_torch(
     return out.clamp(0, 1)
 
 
-def apply_lut_torch(rgb, baseline, lut, confidence, tone=None, chroma_only=False, tone_coord=None):
+def apply_lut_torch(
+    rgb, baseline, lut, confidence, tone=None, chroma_only=False,
+    tone_coord=None, residual_limits=None,
+):
     return apply_correction_torch(
-        rgb, baseline, lut, confidence, tone, chroma_only, fast=False, tone_coord=tone_coord,
+        rgb, baseline, lut, confidence, tone, chroma_only, fast=False,
+        tone_coord=tone_coord, residual_limits=residual_limits,
     )
 
 
-def apply_lut_torch_fast(rgb, baseline, lut, confidence, tone=None, chroma_only=False, tone_coord=None):
+def apply_lut_torch_fast(
+    rgb, baseline, lut, confidence, tone=None, chroma_only=False,
+    tone_coord=None, residual_limits=None,
+):
     return apply_correction_torch(
-        rgb, baseline, lut, confidence, tone, chroma_only, fast=True, tone_coord=tone_coord,
+        rgb, baseline, lut, confidence, tone, chroma_only, fast=True,
+        tone_coord=tone_coord, residual_limits=residual_limits,
     )
 
 
 def apply_lut_on_device(
     rgb, baseline, lut, confidence,
     tone=None, chroma_only: bool = False, look=None, stats=None,
-    relative_tone: bool = False,
+    relative_tone: bool = False, residual_limits=None,
 ):
     """Apply 1D tone + 3D residual + optional look. Interpolation runs on CPU."""
     torch, _, _ = _torch()
@@ -615,6 +638,7 @@ def apply_lut_on_device(
             rgb_t,
             numpy_to_torch(baseline.reshape(-1, 4), cpu),
             lut, confidence, tone, chroma_only, tone_coord=tone_coord,
+            residual_limits=residual_limits,
         )
         if look is not None and stats is not None:
             black, white = stats_black_white(stats)
@@ -677,6 +701,21 @@ class AdaptiveLUTModel:
     @property
     def portrait_region(self) -> str:
         return portrait_region_from_metadata(self.metadata)
+
+    @property
+    def portrait_lut_only(self) -> bool:
+        return bool(self.metadata.get("portrait_lut_only", False))
+
+    @property
+    def portrait_residual_limits(self):
+        if not self.portrait_lut_only:
+            return None
+        values = self.metadata.get("portrait_residual_limits")
+        if values is None:
+            return (0.05, 0.05, 0.05, 0.04)
+        if not isinstance(values, (list, tuple)) or len(values) != LUT_CHANNELS:
+            raise ValueError("portrait_residual_limits 必须包含 C、M、Y、K 四个值")
+        return tuple(float(x) for x in values)
 
     def encode_lut_tensors(self, encoder, image: Image.Image, stats=None):
         torch, _, _ = _torch()
@@ -745,12 +784,16 @@ class AdaptiveLUTModel:
         p_lut, p_conf, p_tone, p_look = self.encode_lut_tensors(
             self.portrait_encoder, crop, p_stats_t,
         )
+        if self.portrait_lut_only:
+            p_tone = None
+            p_look = None
         portrait = apply_lut_on_device(
             rgb, corrected, p_lut, p_conf,
             tone=p_tone, chroma_only=self.tone_split,
             look=p_look if self.has_look else None,
             stats=p_stats,
             relative_tone=self.relative_tone,
+            residual_limits=self.portrait_residual_limits,
         )
         weight = mask.reshape(-1)[sample_idx][..., None] if sample_idx is not None else mask[..., None]
         return np.clip((1.0 - weight) * corrected + weight * portrait, 0.0, 1.0)

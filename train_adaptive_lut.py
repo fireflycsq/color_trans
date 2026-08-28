@@ -124,21 +124,27 @@ def encode_full(encoder, image: Image.Image, device, stats=None, size: int | Non
     return encoder(image_to_tensor(image, device), stats)
 
 
-def apply_split(out, rgb, baseline, stats=None, relative_tone: bool = True, apply_look: bool = True):
+def apply_split(
+    out, rgb, baseline, stats=None, relative_tone: bool = True,
+    apply_tone: bool = True, apply_look: bool = True, residual_limits=None,
+):
     lut, conf, tone, look = unpack_encoder_out(out)
+    active_tone = tone if apply_tone else None
+    active_look = look if apply_look else None
     black, white = stats_black_white(stats)
     tone_coord = relative_luma(rgb, black, white) if relative_tone else None
     pred = apply_lut_torch(
         rgb, baseline, lut[0], conf[0],
-        None if tone is None else tone[0],
+        None if active_tone is None else active_tone[0],
         chroma_only=True,
         tone_coord=tone_coord,
+        residual_limits=residual_limits,
     )
-    if apply_look and look is not None:
+    if active_look is not None:
         black_t = pred.new_tensor(float(black) if not hasattr(black, "item") else float(black.item()))
         white_t = pred.new_tensor(float(white) if not hasattr(white, "item") else float(white.item()))
-        pred = apply_look_cmyk_torch(pred, look[0], black_t, white_t)
-    return pred, lut, tone, look
+        pred = apply_look_cmyk_torch(pred, active_look[0], black_t, white_t)
+    return pred, lut, active_tone, active_look
 
 
 def luma_pixel_weight(rgb, strength: float):
@@ -186,6 +192,14 @@ def train_epoch(
                 rgb_t, base_t, thumb_stats, relative_tone,
             )
         else:
+            portrait_limits = None
+            if args.portrait_lut_only:
+                portrait_limits = (
+                    args.portrait_residual_limit_cmy,
+                    args.portrait_residual_limit_cmy,
+                    args.portrait_residual_limit_cmy,
+                    args.portrait_residual_limit_k,
+                )
             portrait_rgb_u8 = full_srgb_array(rgb_u8, src_icc)
             mask_img = portrait_mask(portrait_rgb_u8, region=region)
             crop = portrait_crop(
@@ -204,6 +218,9 @@ def train_epoch(
             portrait, lut, tone, look_pred = apply_split(
                 encode_full(encoder, crop, device, crop_stats),
                 rgb_t, base, crop_stats, relative_tone,
+                apply_tone=not args.portrait_lut_only,
+                apply_look=not args.portrait_lut_only,
+                residual_limits=portrait_limits,
             )
             gate = numpy_to_torch(mask.astype(np.float32), device).unsqueeze(-1)
             pred = (1.0 - gate) * base + gate * portrait
@@ -408,6 +425,20 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--stage", choices=("global", "portrait"), default="global")
     p.add_argument("--region", choices=("person", "skin"), default="person")
+    p.add_argument(
+        "--portrait-lut-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="portrait stage trains only a bounded 3D CMYK residual; default on",
+    )
+    p.add_argument(
+        "--portrait-residual-limit-cmy", type=float, default=0.05,
+        help="absolute effective C/M/Y residual limit in CMYK 0..1",
+    )
+    p.add_argument(
+        "--portrait-residual-limit-k", type=float, default=0.04,
+        help="absolute effective K residual limit in CMYK 0..1",
+    )
     p.add_argument("--grid-size", type=int, default=17)
     p.add_argument("--channels", type=int, default=32)
     p.add_argument("--thumbnail", type=int, default=THUMBNAIL)
@@ -552,6 +583,16 @@ def model_metadata(
         "tone_smoothness": args.tone_smoothness,
         "portrait_region": region if args.stage == "portrait" else None,
         "portrait_mask_threshold": args.mask_threshold if args.stage == "portrait" else None,
+        "portrait_lut_only": args.portrait_lut_only if args.stage == "portrait" else False,
+        "portrait_residual_limits": (
+            [
+                args.portrait_residual_limit_cmy,
+                args.portrait_residual_limit_cmy,
+                args.portrait_residual_limit_cmy,
+                args.portrait_residual_limit_k,
+            ]
+            if args.stage == "portrait" and args.portrait_lut_only else None
+        ),
         "train_pairs": len(train_pairs),
         "validation_pairs": len(val_pairs),
         "samples_per_image": sample_budget(len(train_pairs), args.samples_per_image, args.max_samples),
@@ -576,6 +617,10 @@ def main() -> None:
         raise ValueError("--grid-size 必须至少为 2")
     if args.epochs < 1:
         raise ValueError("--epochs 必须至少为 1")
+    if not 0 < args.portrait_residual_limit_cmy <= 1:
+        raise ValueError("--portrait-residual-limit-cmy 必须在 (0, 1] 范围")
+    if not 0 < args.portrait_residual_limit_k <= 1:
+        raise ValueError("--portrait-residual-limit-k 必须在 (0, 1] 范围")
     if args.early_stopping_patience < 0:
         raise ValueError("--early-stopping-patience 不能为负数")
     if args.lr_patience < 0:
@@ -645,6 +690,12 @@ def main() -> None:
         encoder = create_adaptive_encoder(
             args.grid_size, args.channels, args.tone_bins, version=MODEL_TYPE,
         ).to(device)
+        if args.portrait_lut_only:
+            for head_name in ("tone_head", "look_head"):
+                head = getattr(encoder, head_name, None)
+                if head is not None:
+                    for parameter in head.parameters():
+                        parameter.requires_grad_(False)
         if args.region == "person":
             require_person_segmenter()
         region = args.region
@@ -683,6 +734,12 @@ def main() -> None:
         f"cmyk={args.cmyk_weight:g} appearance={args.appearance_weight:g} "
         f"punch={args.punch_weight:g} k-punch={args.k_punch_weight:g} warmth={args.warmth_weight:g} "
         f"icc-look={args.icc_look_weight:g}"
+        + (
+            f" | portrait LUT-only limits="
+            f"[{args.portrait_residual_limit_cmy:g}×CMY, "
+            f"{args.portrait_residual_limit_k:g}×K]"
+            if args.stage == "portrait" and args.portrait_lut_only else ""
+        )
     )
     for epoch in range(1, args.epochs + 1):
         completed_epochs = epoch

@@ -76,6 +76,9 @@ python3 train_adaptive_lut.py \
   --val-ratio 0.1 \
   --epochs 6 \
   --lr 1e-3 \
+  --portrait-lut-only \
+  --portrait-residual-limit-cmy 0.05 \
+  --portrait-residual-limit-k 0.04 \
   --samples-per-image 8192 \
   --max-samples 1500000 \
   --mask-threshold 0.45 \
@@ -97,6 +100,10 @@ early stopping 均以该人像遮罩指标为准。若没有任何 epoch 优于�
 `--output` 会保存不含人像分支的 global-only 安全回退模型，并在报告中记录
 `portrait_accepted: false`。训练、验证和推理的人像 mask/crop 均使用规范化后的
 sRGB 输入，避免带 Adobe RGB 等内嵌 ICC 的图片在三个阶段产生不同裁切。
+`--portrait-lut-only` 默认开启：人像分支不应用第二套 tone/look，只学习插值后
+有效残差受限的 3D CMYK LUT；默认 CMY 为 ±0.05、K 为 ±0.04。限制在 CMY
+均值中心化之后执行，确保真正写入全图结果的残差不越界。需要复现实验性的旧
+行为时可显式使用 `--no-portrait-lut-only`。
 
 ```bash
 python3 train_adaptive_lut.py \
