@@ -44,8 +44,13 @@ from adaptive_lut_model import (
     tone_smoothness,
     unpack_encoder_out,
 )
-from color_model import apply_embedded_srgb, samples_to_srgb
-from portrait_mask import portrait_crop, portrait_mask, require_person_segmenter
+from color_model import apply_embedded_srgb, samples_to_srgb, srgb_to_lab
+from portrait_mask import (
+    calibrate_soft_mask,
+    portrait_crop,
+    portrait_mask,
+    require_person_segmenter,
+)
 from train import (
     Pair,
     collect_pairs,
@@ -93,6 +98,13 @@ def full_srgb_array(rgb_u8: np.ndarray, icc: bytes | None) -> np.ndarray:
     """Normalize a full RGB array for portrait masking/cropping and inference parity."""
     image = Image.fromarray(np.asarray(rgb_u8, dtype=np.uint8), "RGB")
     return np.asarray(apply_embedded_srgb(image, icc), dtype=np.uint8)
+
+
+def mean_rendered_delta_l(pred: np.ndarray, target: np.ndarray, icc: bytes) -> float:
+    """Signed rendered Lab lightness error: positive means brighter than target."""
+    pred_lab = srgb_to_lab(render_samples(pred, icc))
+    target_lab = srgb_to_lab(render_samples(target, icc))
+    return float(np.mean(pred_lab[..., 0] - target_lab[..., 0]))
 
 
 def icc_samples(rgb_u8: np.ndarray, transform) -> np.ndarray:
@@ -192,6 +204,7 @@ def train_epoch(
                 rgb_t, base_t, thumb_stats, relative_tone,
             )
         else:
+            dual_mask = args.portrait_dual_mask and region == "skin"
             portrait_limits = None
             if args.portrait_lut_only:
                 portrait_limits = (
@@ -201,7 +214,13 @@ def train_epoch(
                     args.portrait_residual_limit_k,
                 )
             portrait_rgb_u8 = full_srgb_array(rgb_u8, src_icc)
-            mask_img = portrait_mask(portrait_rgb_u8, region=region)
+            if dual_mask:
+                person_mask_img = portrait_mask(portrait_rgb_u8, region="person")
+                skin_mask_img = portrait_mask(portrait_rgb_u8, region="skin")
+                mask_img = person_mask_img
+            else:
+                skin_mask_img = None
+                mask_img = portrait_mask(portrait_rgb_u8, region=region)
             crop = portrait_crop(
                 portrait_rgb_u8, mask_img, args.thumbnail, args.mask_threshold,
             )
@@ -222,8 +241,18 @@ def train_epoch(
                 apply_look=not args.portrait_lut_only,
                 residual_limits=portrait_limits,
             )
-            gate = numpy_to_torch(mask.astype(np.float32), device).unsqueeze(-1)
-            pred = (1.0 - gate) * base + gate * portrait
+            if dual_mask:
+                skin_gate = calibrate_soft_mask(
+                    skin_mask_img, args.portrait_skin_gate_low,
+                    args.portrait_skin_gate_high,
+                ).reshape(-1)[idx]
+                channel_gate = np.stack(
+                    [skin_gate, skin_gate, skin_gate, mask], axis=-1,
+                ).astype(np.float32)
+                gate = numpy_to_torch(channel_gate, device)
+            else:
+                gate = numpy_to_torch(mask.astype(np.float32), device).unsqueeze(-1)
+            pred = base + gate * (portrait - base)
             keep = mask >= args.mask_threshold
             if int(np.count_nonzero(keep)) < 32:
                 print(f"[train {i:>4}/{len(pairs)}] {pair.name}: too few {region} pixels", flush=True)
@@ -303,6 +332,8 @@ def evaluate_pairs(
     baselines, preds, targets = [], [], []
     global_preds = []
     masked_globals, masked_preds, masked_targets = [], [], []
+    skin_globals, skin_preds, skin_targets = [], [], []
+    neutral_globals, neutral_preds, neutral_targets = [], [], []
     for i, pair in enumerate(pairs, 1):
         with Image.open(pair.source) as preview:
             width, height = preview.size
@@ -316,9 +347,17 @@ def evaluate_pairs(
             rgb_u8, target_u8, budget, seed + i, transform, src_icc,
         )
         model_rgb_u8 = full_srgb_array(rgb_u8, src_icc) if compare_global else rgb_u8
-        mask = portrait_mask(model_rgb_u8, region=region) if compare_global else None
+        if compare_global:
+            person_mask = portrait_mask(model_rgb_u8, region="person")
+            skin_mask = portrait_mask(model_rgb_u8, region="skin")
+            mask = person_mask if model.portrait_dual_mask else (
+                person_mask if region == "person" else skin_mask
+            )
+        else:
+            person_mask = skin_mask = mask = None
         pred = model.correct_cmyk(
-            model_rgb_u8, baseline, rgb=rgb, sample_idx=idx, thumb=thumb, mask=mask,
+            model_rgb_u8, baseline, rgb=rgb, sample_idx=idx, thumb=thumb,
+            mask=mask, skin_mask=skin_mask,
         )
         pair_icc = metric_summary(baseline, target, icc)
         pair_model = metric_summary(pred, target, icc)
@@ -328,6 +367,20 @@ def evaluate_pairs(
                 model_rgb_u8, baseline, rgb=rgb, sample_idx=idx, thumb=thumb,
             )
             keep = mask.reshape(-1)[idx] >= threshold
+            if model.portrait_dual_mask:
+                skin_low, skin_high = model.portrait_skin_gate_range
+                sampled_skin = calibrate_soft_mask(
+                    skin_mask, skin_low, skin_high,
+                ).reshape(-1)[idx]
+                skin_keep = sampled_skin >= 0.5
+            else:
+                skin_keep = skin_mask.reshape(-1)[idx] >= threshold
+            person_values = person_mask.reshape(-1)[idx]
+            luma = rgb[:, 0] * 0.299 + rgb[:, 1] * 0.587 + rgb[:, 2] * 0.114
+            chroma = rgb.max(axis=-1) - rgb.min(axis=-1)
+            neutral_keep = (
+                (person_values >= threshold) & (luma > 0.55) & (chroma < 0.10)
+            )
             global_preds.append(global_pred)
             if np.any(keep):
                 masked_globals.append(global_pred[keep])
@@ -340,6 +393,14 @@ def evaluate_pairs(
                     f"{pair_mask_global['delta_e76']['mean']:.3f}/"
                     f"{pair_mask_model['delta_e76']['mean']:.3f}"
                 )
+            if np.any(skin_keep):
+                skin_globals.append(global_pred[skin_keep])
+                skin_preds.append(pred[skin_keep])
+                skin_targets.append(target[skin_keep])
+            if np.any(neutral_keep):
+                neutral_globals.append(global_pred[neutral_keep])
+                neutral_preds.append(pred[neutral_keep])
+                neutral_targets.append(target[neutral_keep])
         print(
             f"[{label} {i:>4}/{len(pairs)}] {pair.name}: "
             f"ICC ΔE={pair_icc['delta_e76']['mean']:.3f} "
@@ -388,7 +449,7 @@ def evaluate_pairs(
             if full_global_de else 0.0
         )
         result["portrait_mask"] = {
-            "region": region,
+            "region": "person" if model.portrait_dual_mask else region,
             "threshold": threshold,
             "samples": int(len(masked_pred)),
             "global_only": mask_global_metrics,
@@ -398,6 +459,47 @@ def evaluate_pairs(
                 if mask_global_de else 0.0
             ),
         }
+        if model.portrait_dual_mask and not skin_preds:
+            raise ValueError(f"{label} 验证集中没有可评估的校准皮肤像素")
+        if skin_preds:
+            skin_global_metrics = metric_summary(
+                np.concatenate(skin_globals), np.concatenate(skin_targets), icc,
+            )
+            skin_model_metrics = metric_summary(
+                np.concatenate(skin_preds), np.concatenate(skin_targets), icc,
+            )
+            result["skin_mask"] = {
+                "threshold": 0.5 if model.portrait_dual_mask else threshold,
+                "calibrated": model.portrait_dual_mask,
+                "samples": int(sum(len(x) for x in skin_preds)),
+                "global_only": skin_global_metrics,
+                "global_plus_portrait": skin_model_metrics,
+                "global_only_mean_delta_l": mean_rendered_delta_l(
+                    np.concatenate(skin_globals), np.concatenate(skin_targets), icc,
+                ),
+                "global_plus_portrait_mean_delta_l": mean_rendered_delta_l(
+                    np.concatenate(skin_preds), np.concatenate(skin_targets), icc,
+                ),
+            }
+        if neutral_preds:
+            neutral_global_metrics = metric_summary(
+                np.concatenate(neutral_globals), np.concatenate(neutral_targets), icc,
+            )
+            neutral_model_metrics = metric_summary(
+                np.concatenate(neutral_preds), np.concatenate(neutral_targets), icc,
+            )
+            result["neutral_white_mask"] = {
+                "definition": "person>=threshold, luma>0.55, rgb_chroma<0.10",
+                "samples": int(sum(len(x) for x in neutral_preds)),
+                "global_only": neutral_global_metrics,
+                "global_plus_portrait": neutral_model_metrics,
+                "global_only_mean_delta_l": mean_rendered_delta_l(
+                    np.concatenate(neutral_globals), np.concatenate(neutral_targets), icc,
+                ),
+                "global_plus_portrait_mean_delta_l": mean_rendered_delta_l(
+                    np.concatenate(neutral_preds), np.concatenate(neutral_targets), icc,
+                ),
+            }
     return result
 
 
@@ -438,6 +540,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--portrait-residual-limit-k", type=float, default=0.04,
         help="absolute effective K residual limit in CMYK 0..1",
+    )
+    p.add_argument(
+        "--portrait-dual-mask",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="with --region skin, apply CMY to calibrated skin and K to the full person; default on",
+    )
+    p.add_argument("--portrait-skin-gate-low", type=float, default=0.15)
+    p.add_argument("--portrait-skin-gate-high", type=float, default=0.50)
+    p.add_argument(
+        "--portrait-neutral-max-regression", type=float, default=0.02,
+        help="maximum allowed neutral/white DeltaE regression fraction vs global-only",
+    )
+    p.add_argument(
+        "--portrait-skin-max-regression", type=float, default=0.01,
+        help="maximum allowed skin-mask DeltaE regression fraction vs global-only",
     )
     p.add_argument("--grid-size", type=int, default=17)
     p.add_argument("--channels", type=int, default=32)
@@ -593,6 +711,14 @@ def model_metadata(
             ]
             if args.stage == "portrait" and args.portrait_lut_only else None
         ),
+        "portrait_dual_mask": (
+            args.portrait_dual_mask
+            if args.stage == "portrait" and region == "skin" else False
+        ),
+        "portrait_skin_gate_low": args.portrait_skin_gate_low,
+        "portrait_skin_gate_high": args.portrait_skin_gate_high,
+        "portrait_neutral_max_regression": args.portrait_neutral_max_regression,
+        "portrait_skin_max_regression": args.portrait_skin_max_regression,
         "train_pairs": len(train_pairs),
         "validation_pairs": len(val_pairs),
         "samples_per_image": sample_budget(len(train_pairs), args.samples_per_image, args.max_samples),
@@ -621,6 +747,12 @@ def main() -> None:
         raise ValueError("--portrait-residual-limit-cmy 必须在 (0, 1] 范围")
     if not 0 < args.portrait_residual_limit_k <= 1:
         raise ValueError("--portrait-residual-limit-k 必须在 (0, 1] 范围")
+    if not 0 <= args.portrait_skin_gate_low < args.portrait_skin_gate_high <= 1:
+        raise ValueError("portrait skin gate 需要满足 0 <= low < high <= 1")
+    if args.portrait_neutral_max_regression < 0:
+        raise ValueError("--portrait-neutral-max-regression 不能为负数")
+    if args.portrait_skin_max_regression < 0:
+        raise ValueError("--portrait-skin-max-regression 不能为负数")
     if args.early_stopping_patience < 0:
         raise ValueError("--early-stopping-patience 不能为负数")
     if args.lr_patience < 0:
@@ -696,7 +828,7 @@ def main() -> None:
                 if head is not None:
                     for parameter in head.parameters():
                         parameter.requires_grad_(False)
-        if args.region == "person":
+        if args.region == "person" or args.portrait_dual_mask:
             require_person_segmenter()
         region = args.region
         icc = loaded.target_icc
@@ -740,6 +872,12 @@ def main() -> None:
             f"{args.portrait_residual_limit_k:g}×K]"
             if args.stage == "portrait" and args.portrait_lut_only else ""
         )
+        + (
+            f" | dual-mask CMY=skin[{args.portrait_skin_gate_low:g},"
+            f"{args.portrait_skin_gate_high:g}] K=person"
+            if args.stage == "portrait" and args.region == "skin"
+            and args.portrait_dual_mask else ""
+        )
     )
     for epoch in range(1, args.epochs + 1):
         completed_epochs = epoch
@@ -782,8 +920,43 @@ def main() -> None:
                 )
                 history_item["portrait_mask_delta_e76_mean"] = val_delta_e
                 beats_global = val_delta_e < portrait_global_val_delta_e
-                improved = beats_global and val_delta_e < best_val_delta_e
                 history_item["beats_global_only"] = beats_global
+                skin_guard = True
+                if "skin_mask" in epoch_val_metrics:
+                    skin_metrics = epoch_val_metrics["skin_mask"]
+                    skin_global_de = float(
+                        skin_metrics["global_only"]["delta_e76"]["mean"]
+                    )
+                    skin_model_de = float(
+                        skin_metrics["global_plus_portrait"]["delta_e76"]["mean"]
+                    )
+                    skin_guard = skin_model_de <= skin_global_de * (
+                        1.0 + args.portrait_skin_max_regression
+                    )
+                    history_item["skin_mask_global_only_delta_e76_mean"] = skin_global_de
+                    history_item["skin_mask_delta_e76_mean"] = skin_model_de
+                neutral_guard = True
+                if "neutral_white_mask" in epoch_val_metrics:
+                    neutral_metrics = epoch_val_metrics["neutral_white_mask"]
+                    neutral_global_de = float(
+                        neutral_metrics["global_only"]["delta_e76"]["mean"]
+                    )
+                    neutral_model_de = float(
+                        neutral_metrics["global_plus_portrait"]["delta_e76"]["mean"]
+                    )
+                    neutral_guard = neutral_model_de <= neutral_global_de * (
+                        1.0 + args.portrait_neutral_max_regression
+                    )
+                    history_item["neutral_white_global_only_delta_e76_mean"] = (
+                        neutral_global_de
+                    )
+                    history_item["neutral_white_delta_e76_mean"] = neutral_model_de
+                history_item["skin_guard_passed"] = skin_guard
+                history_item["neutral_white_guard_passed"] = neutral_guard
+                improved = (
+                    beats_global and skin_guard and neutral_guard
+                    and val_delta_e < best_val_delta_e
+                )
             else:
                 val_delta_e = float(epoch_val_metrics["icc_plus_lut"]["delta_e76"]["mean"])
                 improved = val_delta_e < best_val_delta_e
@@ -926,6 +1099,23 @@ def main() -> None:
                 f"val portrait-mask improvement: "
                 f"{portrait_metrics['delta_e76_improvement_percent']:.2f}%"
             )
+            if "skin_mask" in val_metrics:
+                skin_metrics = val_metrics["skin_mask"]
+                print(
+                    f"val skin-mask ΔE76 global/model mean: "
+                    f"{skin_metrics['global_only']['delta_e76']['mean']:.3f} / "
+                    f"{skin_metrics['global_plus_portrait']['delta_e76']['mean']:.3f} "
+                    f"| model mean ΔL={skin_metrics['global_plus_portrait_mean_delta_l']:.3f}"
+                )
+            if "neutral_white_mask" in val_metrics:
+                neutral_metrics = val_metrics["neutral_white_mask"]
+                print(
+                    f"val neutral-white ΔE76 global/model mean: "
+                    f"{neutral_metrics['global_only']['delta_e76']['mean']:.3f} / "
+                    f"{neutral_metrics['global_plus_portrait']['delta_e76']['mean']:.3f} "
+                    f"| model mean ΔL="
+                    f"{neutral_metrics['global_plus_portrait_mean_delta_l']:.3f}"
+                )
 
 
 if __name__ == "__main__":

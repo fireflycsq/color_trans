@@ -18,7 +18,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from color_model import image_to_srgb
-from portrait_mask import detector_name, portrait_mask
+from portrait_mask import calibrate_soft_mask, detector_name, portrait_mask
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
 PANEL_TITLES = ("原图", "叠加", "抠出", "遮罩 + 轮廓")
@@ -166,6 +166,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--region", choices=("person", "skin", "contour"), default="person")
     p.add_argument("--threshold", type=float, default=None, help="same cutoff used in training")
     p.add_argument("--blur-radius", type=float, default=4.0)
+    p.add_argument("--skin-gate-low", type=float, default=0.15)
+    p.add_argument("--skin-gate-high", type=float, default=0.50)
     p.add_argument("--max-dimension", type=int, default=1600)
     p.add_argument("--recursive", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--save-raw-mask", action="store_true", help="also write a grayscale mask PNG")
@@ -180,6 +182,8 @@ def main() -> None:
         raise ValueError("--threshold 必须在 (0, 1] 范围")
     if args.max_dimension < 64:
         raise ValueError("--max-dimension 太小")
+    if not 0 <= args.skin_gate_low < args.skin_gate_high <= 1:
+        raise ValueError("skin gate 需要满足 0 <= low < high <= 1")
     root = Path(args.input or args.input_dir)
     images = collect_images(root, args.recursive)
     out_dir = Path(args.output_dir)
@@ -190,6 +194,10 @@ def main() -> None:
         with Image.open(path) as image:
             rgb = np.asarray(image_to_srgb(image), dtype=np.uint8)
         mask = portrait_mask(rgb, blur_radius=args.blur_radius, region=args.region)
+        if args.region == "skin":
+            mask = calibrate_soft_mask(
+                mask, args.skin_gate_low, args.skin_gate_high,
+            )
         coverage = float((mask >= args.threshold).mean())
         mean = float(mask.mean())
         preview_rgb, preview_mask = fit_within(rgb, mask, args.max_dimension)
@@ -221,6 +229,10 @@ def main() -> None:
         "region": args.region,
         "detector": detector_name(args.region),
         "threshold": args.threshold,
+        "skin_gate": (
+            [args.skin_gate_low, args.skin_gate_high]
+            if args.region == "skin" else None
+        ),
         "images": len(rows),
         "mean_coverage": float(np.mean([x["coverage_at_threshold"] for x in rows])),
         "rows": rows,

@@ -22,6 +22,7 @@ from color_model import (
     srgb_to_cmyk_transform,
 )
 from portrait_mask import (
+    calibrate_soft_mask,
     has_person_segmenter,
     portrait_crop,
     portrait_edge_weight,
@@ -717,6 +718,19 @@ class AdaptiveLUTModel:
             raise ValueError("portrait_residual_limits 必须包含 C、M、Y、K 四个值")
         return tuple(float(x) for x in values)
 
+    @property
+    def portrait_dual_mask(self) -> bool:
+        """CMY on calibrated skin, K on the full person silhouette."""
+        return bool(self.metadata.get("portrait_dual_mask", False))
+
+    @property
+    def portrait_skin_gate_range(self) -> tuple[float, float]:
+        low = float(self.metadata.get("portrait_skin_gate_low", 0.15))
+        high = float(self.metadata.get("portrait_skin_gate_high", 0.50))
+        if not 0.0 <= low < high <= 1.0:
+            raise ValueError("portrait skin gate 需要满足 0 <= low < high <= 1")
+        return low, high
+
     def encode_lut_tensors(self, encoder, image: Image.Image, stats=None):
         torch, _, _ = _torch()
         if stats is None and self.has_stats:
@@ -752,6 +766,7 @@ class AdaptiveLUTModel:
         sample_idx: np.ndarray | None = None,
         thumb: Image.Image | None = None,
         mask: np.ndarray | None = None,
+        skin_mask: np.ndarray | None = None,
     ) -> np.ndarray:
         thumbnail = int(self.metadata.get("thumbnail", THUMBNAIL))
         if thumb is None:
@@ -772,9 +787,17 @@ class AdaptiveLUTModel:
         )
         if self.portrait_encoder is None:
             return corrected
-        if mask is None:
-            mask = portrait_mask(rgb_u8, region=self.portrait_region)
-        crop = portrait_crop(rgb_u8, mask, size=thumbnail)
+        if self.portrait_dual_mask:
+            if mask is None:
+                mask = portrait_mask(rgb_u8, region="person")
+            if skin_mask is None:
+                skin_mask = portrait_mask(rgb_u8, region="skin")
+            crop_mask = mask
+        else:
+            if mask is None:
+                mask = portrait_mask(rgb_u8, region=self.portrait_region)
+            crop_mask = mask
+        crop = portrait_crop(rgb_u8, crop_mask, size=thumbnail)
         if crop is None:
             return corrected
         p_stats = thumbnail_stats(crop) if self.has_stats else None
@@ -795,8 +818,24 @@ class AdaptiveLUTModel:
             relative_tone=self.relative_tone,
             residual_limits=self.portrait_residual_limits,
         )
-        weight = mask.reshape(-1)[sample_idx][..., None] if sample_idx is not None else mask[..., None]
-        return np.clip((1.0 - weight) * corrected + weight * portrait, 0.0, 1.0)
+        if self.portrait_dual_mask:
+            low, high = self.portrait_skin_gate_range
+            skin_gate = calibrate_soft_mask(skin_mask, low, high)
+            if sample_idx is not None:
+                person_weight = mask.reshape(-1)[sample_idx][..., None]
+                skin_weight = skin_gate.reshape(-1)[sample_idx][..., None]
+            else:
+                person_weight = mask[..., None]
+                skin_weight = skin_gate[..., None]
+            weight = np.concatenate(
+                [np.repeat(skin_weight, 3, axis=-1), person_weight], axis=-1,
+            )
+        else:
+            weight = (
+                mask.reshape(-1)[sample_idx][..., None]
+                if sample_idx is not None else mask[..., None]
+            )
+        return np.clip(corrected + weight * (portrait - corrected), 0.0, 1.0)
 
     def predict_image(
         self,
@@ -817,9 +856,17 @@ class AdaptiveLUTModel:
         )
         region = self.portrait_region if self.portrait_encoder is not None else "person"
         mask = None
+        skin_mask = None
         if self.portrait_encoder is not None or need_edge:
-            mask = portrait_mask(rgb_u8, region=region)
-        cmyk = self.correct_cmyk(rgb_u8, baseline, mask=mask)
+            if self.portrait_encoder is not None and self.portrait_dual_mask:
+                mask = portrait_mask(rgb_u8, region="person")
+                skin_mask = portrait_mask(rgb_u8, region="skin")
+                region = "person"
+            else:
+                mask = portrait_mask(rgb_u8, region=region)
+        cmyk = self.correct_cmyk(
+            rgb_u8, baseline, mask=mask, skin_mask=skin_mask,
+        )
         if need_edge:
             edge = mask if region == "contour" else portrait_edge_weight(mask)
             if c_lift > 0:

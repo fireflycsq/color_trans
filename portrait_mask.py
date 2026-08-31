@@ -231,6 +231,16 @@ def portrait_edge_weight(mask: np.ndarray) -> np.ndarray:
     return (4.0 * mask * (1.0 - mask)).astype(np.float32)
 
 
+def calibrate_soft_mask(
+    mask: np.ndarray, low: float = 0.15, high: float = 0.50,
+) -> np.ndarray:
+    """Map a conservative probability mask to a stronger but still soft gate."""
+    if not 0.0 <= low < high <= 1.0:
+        raise ValueError("mask gate 需要满足 0 <= low < high <= 1")
+    values = np.asarray(mask, dtype=np.float32)
+    return np.clip((values - low) / (high - low), 0.0, 1.0).astype(np.float32)
+
+
 def _blur_mask(mask: np.ndarray, blur_radius: float) -> np.ndarray:
     if blur_radius <= 0:
         return mask

@@ -105,6 +105,36 @@ sRGB 输入，避免带 Adobe RGB 等内嵌 ICC 的图片在三个阶段产生�
 均值中心化之后执行，确保真正写入全图结果的残差不越界。需要复现实验性的旧
 行为时可显式使用 `--no-portrait-lut-only`。
 
+推荐的人像模式是 `--region skin --portrait-dual-mask`（dual-mask 默认开启）：
+同一个自适应残差编码器生成 CMYK LUT，但 C/M/Y 只通过校准后的皮肤遮罩混合，
+K 则通过完整人物遮罩混合。这样全人物可以学习轻微明暗修正，而白衬衫、白西装、
+灰色服装不会接收皮肤 CMY 偏色。皮肤原始概率通过默认 `[0.15, 0.50]` 区间
+重新映射到 `[0, 1]`，避免高可信皮肤只应用三四成修正：
+
+```bash
+python3 train_adaptive_lut.py \
+  --stage portrait \
+  --region skin \
+  --portrait-dual-mask \
+  --portrait-skin-gate-low 0.15 \
+  --portrait-skin-gate-high 0.50 \
+  --portrait-lut-only \
+  --portrait-residual-limit-cmy 0.025 \
+  --portrait-residual-limit-k 0.06 \
+  --portrait-neutral-max-regression 0.02 \
+  --portrait-skin-max-regression 0.01 \
+  --model models/adaptive_global.pt \
+  --output models/adaptive_portrait.pt \
+  --pair-dir dataset/pairs \
+  --target-icc profiles/PSOcoated_v3.icc
+```
+
+每个 epoch 还会分别报告 `skin_mask` 和 `neutral_white_mask`。只有人物主指标改善、
+皮肤 ΔE 不超过 global-only 的 1% 回退上限、且中性/白衣 ΔE 不超过 2% 回退上限，
+该 epoch 才能成为最佳模型。两个子集同时记录有符号 `mean_delta_l`：正值表示比
+目标亮，负值表示比目标暗。`visualize_portrait_mask.py --region skin` 使用相同的
+皮肤 gate 标定参数，便于训练前检查实际 CMY 作用范围。
+
 ```bash
 python3 train_adaptive_lut.py \
   --stage global \
